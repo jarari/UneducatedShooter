@@ -137,6 +137,23 @@ NiNode* InsertBone(NiAVObject* root, NiNode* node, const char* name)
 		inserted->AttachChild(node, true);
 		//_MESSAGE("%s (%llx) inserted to %s (%llx).", name, inserted, parent->name.c_str(), parent);
 		return inserted;
+	} else {
+		if (!inserted->GetObjectByName(node->name)) {
+			_MESSAGE("%s structure mismatch. Reinserting...", inserted->name.c_str());
+			inserted->parent->DetachChild(inserted);
+			inserted = CreateBone(name);
+			//_MESSAGE("%s (%llx) created.", name, inserted);
+			if (parent) {
+				parent->DetachChild(node);
+				parent->AttachChild(inserted, true);
+				inserted->parent = parent;
+			} else {
+				parent = node;
+			}
+			inserted->local.translate = NiPoint3();
+			inserted->local.rotate.MakeIdentity();
+			inserted->AttachChild(node, true);
+		}
 	}
 	return nullptr;
 }
@@ -693,23 +710,6 @@ void HookedUpdate()
 		}
 
 		if (isFP) {
-			//float rayDist = 70.0f * abs(sin(leanMax * toRad));
-			//CastRay(a, rayOrigin, rayDir, rayDist);
-			colTransX = NiPoint3(transDist * leanWeight * heightRatio, 0, 0);
-			NiNode* chestInserted1st = (NiNode*)node->GetObjectByName("ChestInserted1st");
-			if (chestInserted1st) {
-				NiMatrix3 rot = GetRotationMatrix33(0, rotY * toRad, -rotX * toRad);
-				chestInserted1st->local.rotate = rot;
-			}
-
-			NiNode* comInserted1st = (NiNode*)node->GetObjectByName("COMInserted1st");
-			if (comInserted1st) {
-				NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
-				comInserted1st->local.rotate = rot;
-				comInserted1st->local.translate = colTransX;
-				//_MESSAGE("comInserted");
-			}
-
 			NiNode* cameraInserted1st = (NiNode*)node->GetObjectByName("CameraInserted1st");
 			NiNode* camera = (NiNode*)node->GetObjectByName("Camera");
 			if (camera && cameraInserted1st) {
@@ -733,6 +733,23 @@ void HookedUpdate()
 					cameraInserted1st->local.translate = rot * camPos - camPos + colTransX;
 					cameraInserted1st->local.rotate.MakeIdentity();
 				}
+			}
+
+			//float rayDist = 70.0f * abs(sin(leanMax * toRad));
+			//CastRay(a, rayOrigin, rayDir, rayDist);
+			colTransX = NiPoint3(transDist * leanWeight * heightRatio, 0, 0);
+			NiNode* chestInserted1st = (NiNode*)node->GetObjectByName("ChestInserted1st");
+			if (camera && chestInserted1st) {
+				NiMatrix3 rot = chestInserted1st->parent->world.rotate * GetRotationMatrix33(ToRightVector(camera->world.rotate), rotX * toRad) * GetRotationMatrix33(ToUpVector(camera->world.rotate), rotY * toRad) * Transpose(chestInserted1st->parent->world.rotate);  //GetRotationMatrix33(0, rotY * toRad, -rotX * toRad);
+				chestInserted1st->local.rotate = rot;
+			}
+
+			NiNode* comInserted1st = (NiNode*)node->GetObjectByName("COMInserted1st");
+			if (comInserted1st) {
+				NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
+				comInserted1st->local.rotate = rot;
+				comInserted1st->local.translate = colTransX;
+				//_MESSAGE("comInserted");
 			}
 		}
 	}
