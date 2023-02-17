@@ -67,8 +67,8 @@ float rotLimitX = 10.0f;
 float rotLimitY = 5.0f;
 float rotDivX = 10.0f;
 float rotDivY = 20.0f;
-float rotDivXPad = 4.0f;
-float rotDivYPad = 8.0f;
+float rotDivXADS = 4.0f;
+float rotDivYADS = 8.0f;
 float rotADSConditionMult = 5.0f;
 float rotReturnDiv = 1.5f;
 float rotReturnStep = 0.1f;
@@ -222,14 +222,14 @@ enum NiAVObjectFlag
 void LoadConfigs()
 {
 	ini.LoadFile("Data\\F4SE\\Plugins\\UneducatedShooter.ini");
-	rotLimitX = std::stof(ini.GetValue("Inertia", "rotLimitX", "12.0"));
-	rotLimitY = std::stof(ini.GetValue("Inertia", "rotLimitY", "7.0"));
-	rotDivX = std::stof(ini.GetValue("Inertia", "rotDivX", "10.0"));
-	rotDivY = std::stof(ini.GetValue("Inertia", "rotDivY", "15.0"));
-	rotDivXPad = std::stof(ini.GetValue("Inertia", "rotDivXPad", "4.0"));
-	rotDivYPad = std::stof(ini.GetValue("Inertia", "rotDivYPad", "8.0"));
-	rotADSConditionMult = std::stof(ini.GetValue("Inertia", "rotADSConditionMult", "5.0"));
-	rotReturnDiv = std::stof(ini.GetValue("Inertia", "rotReturnDiv", "1.75"));
+	rotLimitX = std::stof(ini.GetValue("Inertia", "rotLimitX", "16.0"));
+	rotLimitY = std::stof(ini.GetValue("Inertia", "rotLimitY", "8.0"));
+	rotDivX = std::stof(ini.GetValue("Inertia", "rotDivX", "4.0"));
+	rotDivY = std::stof(ini.GetValue("Inertia", "rotDivY", "4.0"));
+	rotDivXADS = std::stof(ini.GetValue("Inertia", "rotDivXADS", "12.0"));
+	rotDivYADS = std::stof(ini.GetValue("Inertia", "rotDivYADS", "12.0"));
+	rotADSConditionMult = std::stof(ini.GetValue("Inertia", "rotADSConditionMult", "4.0"));
+	rotReturnDiv = std::stof(ini.GetValue("Inertia", "rotReturnDiv", "2.0"));
 	rotReturnDivMin = std::stof(ini.GetValue("Inertia", "rotReturnDivMin", "1.05"));
 	rotReturnStep = std::stof(ini.GetValue("Inertia", "rotReturnStep", "0.0"));
 	rotDisableInADS = std::stoi(ini.GetValue("Inertia", "rotDisableInADS", "0")) > 0;
@@ -451,6 +451,8 @@ void HookedUpdate()
 		}
 
 #pragma region Inertia
+		float tempRotDivX = rotDivX;
+		float tempRotDivY = rotDivY;
 		float conditionalMultiplier = 1.0f;
 		if (a->GetActorValue(*leftAttackCondition) == 0) {
 			conditionalMultiplier -= 0.2f;
@@ -460,20 +462,20 @@ void HookedUpdate()
 		}
 		if (IsInADS(a)) {
 			conditionalMultiplier *= rotADSConditionMult;
-			if (rotDisableInADS) {
-				rotX = 0;
-				rotY = 0;
-			}
+			tempRotDivX = rotDivXADS;
+			tempRotDivY = rotDivYADS;
 		}
 		float step = rotReturnStep * conditionalMultiplier * timeMult;
 		float retDiv = max(pow(rotReturnDiv * conditionalMultiplier, timeMult), rotReturnDivMin);
 		float followDiv = max(pow(3.0f, timeMult), 1.0f);
 		float eulerX, eulerY, eulerZ;
 		(pcam->cameraRoot->world.rotate * Transpose(lastCamRot)).ToEulerAnglesXYZ(eulerX, eulerY, eulerZ);
-		targetRotZ -= eulerZ / toRad / rotDivY * 5.f;
-		targetRotX -= eulerX / toRad / rotDivX * 5.f;
+		targetRotZ -= eulerZ / toRad / tempRotDivY * 5.f;
+		targetRotX -= eulerX / toRad / tempRotDivX * 5.f;
 		rotX += (targetRotX - rotX) / followDiv;
+		rotX = max(min(rotX, rotLimitX), -rotLimitX);
 		rotY += (targetRotZ - rotY) / followDiv;
+		rotY = max(min(rotY, rotLimitY), -rotLimitY);
 		targetRotZ /= retDiv;
 		targetRotX /= retDiv;
 		lastCamRot = pcam->cameraRoot->world.rotate;
@@ -496,6 +498,12 @@ void HookedUpdate()
 				rotY += step;
 			}
 		}
+		if (IsInADS(a) && rotDisableInADS) {
+			rotX = 0;
+			rotY = 0;
+			targetRotZ = 0;
+			targetRotX = 0;
+		}
 #pragma endregion
 
 		if (leanADSOnly && !IsInADS(a)) {
@@ -504,7 +512,7 @@ void HookedUpdate()
 
 		if (leanState != 0) {
 			UI* ui = UI::GetSingleton();
-			if (ui->GetMenuOpen("WorkshopMenu") || ui->GetMenuOpen("DialogueMenu") || ui->GetMenuOpen("LooksMenu") || a->interactingState != INTERACTING_STATE::kNotInteracting || (a->moveMode & 0x100) == 0x100) {
+			if (ui->GetMenuOpen("WorkshopMenu") || ui->GetMenuOpen("DialogueMenu") || ui->GetMenuOpen("LooksMenu") || a->interactingState != INTERACTING_STATE::kNotInteracting || (a->moveMode & 0x100) == 0x100 || (a->knockState & 0xF) == 0x7) {
 				SetLeanState(0);
 			}
 		}
@@ -879,6 +887,7 @@ class MenuWatcher : public BSTEventSink<MenuOpenCloseEvent>
 		if (evn.menuName == BSFixedString("LoadingMenu")) {
 			if (evn.opening) {
 				isLoading = true;
+				leanState = 0;
 			} else {
 				isLoading = false;
 			}
