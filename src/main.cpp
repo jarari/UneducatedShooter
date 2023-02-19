@@ -512,7 +512,7 @@ void HookedUpdate()
 
 		if (leanState != 0) {
 			UI* ui = UI::GetSingleton();
-			if (ui->GetMenuOpen("WorkshopMenu") || ui->GetMenuOpen("DialogueMenu") || ui->GetMenuOpen("LooksMenu") || a->interactingState != INTERACTING_STATE::kNotInteracting || (a->moveMode & 0x100) == 0x100 || (a->knockState & 0xF) == 0x7) {
+			if (ui->GetMenuOpen("WorkshopMenu") || ui->GetMenuOpen("DialogueMenu") || ui->GetMenuOpen("LooksMenu") || a->interactingState != INTERACTING_STATE::kNotInteracting || (a->moveMode & 0x100) == 0x100 || (*(uint32_t*)((uintptr_t)a + 0x130) & 0x1E00000) == 0xE00000) {
 				SetLeanState(0);
 			}
 		}
@@ -760,6 +760,8 @@ void HookedUpdate()
 				//_MESSAGE("comInserted");
 			}
 		}
+	} else {
+		SetLeanState(0);
 	}
 	lastRun = curTime;
 	/*typedef void (*FnUpdateSceneGraph)(PlayerCharacter*);
