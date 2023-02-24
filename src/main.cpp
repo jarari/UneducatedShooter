@@ -10,35 +10,6 @@ using namespace F4SE;
 #define HAVOKTOFO4 69.99124f
 
 using std::vector;
-/*using RE::NiAVObject;
-using RE::NiNode;
-using RE::NiPointer;
-using RE::NiPoint3;
-using RE::NiMatrix3;
-using RE::Actor;
-using RE::PlayerCharacter;
-using RE::PlayerCamera;
-using RE::PlayerControls;
-using RE::ActorValueInfo;
-using RE::bhkCharacterController;
-using RE::PlayerInputHandler;
-using RE::PlayerControlsData;
-using RE::MouseMoveEvent;
-using RE::ThumbstickEvent;
-using RE::UI;
-using RE::CameraState;
-using RE::bhkCharacterMoveFinishEvent;
-using RE::BSTEventSource;
-using RE::INTERACTING_STATE;
-using RE::BSEventNotifyControl;
-using RE::BSInputEventReceiver;
-using RE::ButtonEvent;
-using RE::InputEvent;
-using RE::INPUT_DEVICE;
-using RE::INPUT_EVENT_TYPE;
-using RE::BSTEventSink;
-using RE::TESForm;
-using RE::GameSettingCollection;*/
 using namespace RE;
 
 #pragma region Variables
@@ -104,6 +75,10 @@ float heightDiffThreshold = 5.0f;
 float heightBuffer = 16.0f;
 bool dynamicHeight = false;
 bool isLoading = false;
+bool inWorkShopMenu = false;
+bool inLooksMenu = false;
+bool inDialogueMenu = false;
+bool inPipboyMenu = false;
 
 #pragma endregion
 
@@ -414,6 +389,11 @@ LeanLookHandler::FnOnThumbstickEvent LeanLookHandler::thumbstickEvn;
 
 void HookedUpdate()
 {
+	typedef void (*FnUpdate)();
+	FnUpdate fn = (FnUpdate)PCUpdateMainThreadOrig;
+	if (fn)
+		(*fn)();
+
 	float curTime = *F4::ptr_engineTime;
 	if (iniDevMode && curTime - lastiniUpdate > 5.0f) {
 		LoadConfigs();
@@ -438,7 +418,8 @@ void HookedUpdate()
 		float pcScale = GetActorScale(p);
 		float heightRatio = 1;
 		float transDist = 0;
-		NiPoint3 pos, dir, right;
+		NiPoint3 pos, dir;
+		NiPoint3 right = NiPoint3(-1, 0, 0);
 		a->GetEyeVector(pos, dir, true);
 		NiPoint3 heading = Normalize(NiPoint3(dir.x, dir.y, 0));
 		if (root) {
@@ -498,7 +479,7 @@ void HookedUpdate()
 				rotY += step;
 			}
 		}
-		if (IsInADS(a) && rotDisableInADS) {
+		if ((IsInADS(a) && rotDisableInADS) || inPipboyMenu) {
 			rotX = 0;
 			rotY = 0;
 			targetRotZ = 0;
@@ -511,8 +492,7 @@ void HookedUpdate()
 		}
 
 		if (leanState != 0) {
-			UI* ui = UI::GetSingleton();
-			if (ui->GetMenuOpen("WorkshopMenu") || ui->GetMenuOpen("DialogueMenu") || ui->GetMenuOpen("LooksMenu") || a->interactingState != INTERACTING_STATE::kNotInteracting || (a->moveMode & 0x100) == 0x100 || (*(uint32_t*)((uintptr_t)a + 0x130) & 0x1E00000) == 0xE00000) {
+			if (inWorkShopMenu || inDialogueMenu || inLooksMenu || a->interactingState != INTERACTING_STATE::kNotInteracting || (a->moveMode & 0x100) == 0x100 || (*(uint32_t*)((uintptr_t)a + 0x130) & 0x1E00000) == 0xE00000) {
 				SetLeanState(0);
 			}
 		}
@@ -596,7 +576,7 @@ void HookedUpdate()
 									multiShape->data[i].scale.x = ratio;
 								}
 							}
-							hknpDynamicCompoundShapeData* shapeData = *(hknpDynamicCompoundShapeData**)((uintptr_t)colShape + 0xC0);
+							/*hknpDynamicCompoundShapeData* shapeData = *(hknpDynamicCompoundShapeData**)((uintptr_t)colShape + 0xC0);
 							if (shapeData) {
 								if (cachedShape[4].size() == 0) {
 									for (int i = 0; i < 8; ++i) {
@@ -606,36 +586,17 @@ void HookedUpdate()
 								for (int i = 0; i < cachedShape[4].size(); ++i) {
 									shapeData->bbv->vertex[i].x = cachedShape[4][i].x * ratio;
 								}
-							}
+							}*/
 						}
 						uintptr_t charProxy = *(uintptr_t*)((uintptr_t)con + 0x470);
 						if (charProxy) {
 							hkTransform* charProxyTransform = (hkTransform*)(charProxy + 0x40);
-							hkVector4f* charProxyVel = (hkVector4f*)(charProxy + 0xA0);
-							hkVector4f& charProxyLastDisplacement = *(hkVector4f*)(charProxy + 0xB0);
-							//_MESSAGE("Length %f", (charProxyLastDisplacement - charProxyVel * con->stepInfo.deltaTime.storage).Length());
-							//float diff = DotProduct(charProxyVel - con->velocityMod, right * -deltaLeanWeight);
 							float deltaDist = transDist * deltaLeanWeight / HAVOKTOFO4;
 							F4::bhkPickData pick = F4::bhkPickData();
-							GetPickData(a->data.location + NiPoint3(0, 0, 25.f), a->data.location + NiPoint3(0, 0, 25.f) - right * 1000.f * Sign(deltaLeanWeight), a, nullptr, pick);
+							GetPickData(a->data.location + NiPoint3(0, 0, 25.f), a->data.location + NiPoint3(0, 0, 25.f) - right * transDist * Sign(deltaLeanWeight), a, nullptr, pick);
 							bool colDetected = false;
 							hkVector4f displacement = right * -deltaDist;
-							if (pick.HasHit()) {
-								NiPoint3 colPos = NiPoint3(*(float*)((uintptr_t)&pick + 0x60),
-													  *(float*)((uintptr_t)&pick + 0x64),
-													  *(float*)((uintptr_t)&pick + 0x68)) /
-								                  *ptr_fBS2HkScale;
-								float colDist = Length(colPos - a->data.location + NiPoint3(0, 0, 25.f));
-								if (colDist < transDist) {
-									colDetected = true;
-								}
-								if (collisionDevMode) {
-									_MESSAGE("Collision Detected colDist %f", colDist);
-								}
-							}
-							if (!colDetected) {
-								//a->ApplyMovementDelta(deltaTime, displacementA, NiPoint3());
-								//((ActorEx*)a)->Move(deltaTime, displacementA, true);
+							if (!pick.HasHit()) {
 								charProxyTransform->m_translation.v.x += displacement.x;
 								charProxyTransform->m_translation.v.y += displacement.y;
 								charProxyTransform->m_translation.v.z += displacement.z;
@@ -743,9 +704,6 @@ void HookedUpdate()
 				}
 			}
 
-			//float rayDist = 70.0f * abs(sin(leanMax * toRad));
-			//CastRay(a, rayOrigin, rayDir, rayDist);
-			colTransX = NiPoint3(transDist * leanWeight * heightRatio, 0, 0);
 			NiNode* chestInserted1st = (NiNode*)node->GetObjectByName("ChestInserted1st");
 			if (camera && chestInserted1st) {
 				NiMatrix3 rot = chestInserted1st->parent->world.rotate * GetRotationMatrix33(ToRightVector(camera->world.rotate), rotX * toRad) * GetRotationMatrix33(ToUpVector(camera->world.rotate), rotY * toRad) * Transpose(chestInserted1st->parent->world.rotate);  //GetRotationMatrix33(0, rotY * toRad, -rotX * toRad);
@@ -764,14 +722,6 @@ void HookedUpdate()
 		SetLeanState(0);
 	}
 	lastRun = curTime;
-	/*typedef void (*FnUpdateSceneGraph)(PlayerCharacter*);
-	FnUpdateSceneGraph fn = (FnUpdateSceneGraph)UpdateSceneGraphOrig;
-	if (fn)
-		fn(a);*/
-	typedef void (*FnUpdate)();
-	FnUpdate fn = (FnUpdate)PCUpdateMainThreadOrig;
-	if (fn)
-		(*fn)();
 }
 
 class InputEventReceiverOverride : public BSInputEventReceiver
@@ -874,7 +824,7 @@ public:
 			if (evn.formId == 0x14) {
 				_MESSAGE("Player loaded");
 				playerLastLoaded = *F4::ptr_engineTime;
-				//PreparePlayerSkeleton();
+				PreparePlayerSkeleton();
 			}
 		}
 		return BSEventNotifyControl::kContinue;
@@ -892,6 +842,30 @@ class MenuWatcher : public BSTEventSink<MenuOpenCloseEvent>
 				leanState = 0;
 			} else {
 				isLoading = false;
+			}
+		} else if (evn.menuName == BSFixedString("WorkshopMenu")) {
+			if (evn.opening) {
+				inWorkShopMenu = true;
+			} else {
+				inWorkShopMenu = false;
+			}
+		} else if (evn.menuName == BSFixedString("DialogueMenu")) {
+			if (evn.opening) {
+				inDialogueMenu = true;
+			} else {
+				inDialogueMenu = false;
+			}
+		} else if (evn.menuName == BSFixedString("LooksMenu")) {
+			if (evn.opening) {
+				inLooksMenu = true;
+			} else {
+				inLooksMenu = false;
+			}
+		} else if (evn.menuName == BSFixedString("PipboyMenu")) {
+			if (evn.opening) {
+				inPipboyMenu = true;
+			} else {
+				inPipboyMenu = false;
 			}
 		}
 		return BSEventNotifyControl::kContinue;
