@@ -157,6 +157,12 @@ include_directories(
 		${CMAKE_SOURCE_DIR}/Utilities
 )
 
+target_link_directories(
+	${PROJECT_NAME}
+	PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
 target_include_directories(
 	${PROJECT_NAME}
 	PRIVATE

@@ -1,3 +1,4 @@
+#include <DetourXS/detourxs.h>
 #include <Havok.h>
 #include <MathUtils.h>
 #include <SimpleIni.h>
@@ -14,18 +15,24 @@ using namespace RE;
 
 #pragma region Variables
 
-class CharacterMoveFinishEventWatcher;
+class hknpDynamicCompoundShape;
+typedef bool (*_updateAabb)(hknpDynamicCompoundShape*);
+REL::Relocation<_updateAabb*> updateAabb{ VTABLE::hknpDynamicCompoundShape[0], 0xF0 };
 
 REL::Relocation<uintptr_t> ptr_ADS_DistanceCheck{ REL::ID(1278889), 0x31 };
-REL::Relocation<uintptr_t> ptr_PCUpdateMainThread{ REL::ID(633524), 0x22D };
-uintptr_t PCUpdateMainThreadOrig;
+/*REL::Relocation<uintptr_t> ptr_PCUpdateMainThread{REL::ID(633524), 0x22D};
+static uintptr_t PCUpdateMainThreadOrig;
 REL::Relocation<uintptr_t> ptr_UpdateSceneGraph{ REL::ID(1318162), 0xD5 };
-static uintptr_t UpdateSceneGraphOrig;
-vector<hkVector4f> cachedShape[5];
+static uintptr_t UpdateSceneGraphOrig;*/
+REL::Relocation<uintptr_t> ptr_bhkWorldUpdate{ REL::ID(1395106) };
+static uintptr_t bhkWorldUpdateOrig;
+DetourXS bhkWorldUpdateHook;
+//vector<hkVector4f> cachedShape[5];
 CSimpleIniA ini(true, true, false);
 PlayerCharacter* p;
 PlayerCamera* pcam;
 PlayerControls* pc;
+F4::bhkPickData* pick;
 NiNode* lastRoot;
 BSBound* bbx;
 ActorValueInfo* rightAttackCondition;
@@ -54,8 +61,6 @@ float leanTime;
 float leanTimeCost = 1.0f;
 float leanMax = 15.0f;
 float leanMax3rd = 30.0f;
-float leanCollisionThreshold = 0.08f;
-float leanDistMoved;
 float leanCumulativeMouseX = 0;
 float leanCumulativeMouseY = 0;
 NiPoint3 leanLastDir;
@@ -139,7 +144,6 @@ bool IsInPowerArmor(Actor* a)
 		return false;
 	}
 	return a->extraList->HasType(RE::EXTRA_DATA_TYPE::kPowerArmor);
-	;
 }
 
 bool IsInADS(Actor* a)
@@ -220,7 +224,6 @@ void LoadConfigs()
 	dynamicHeight = std::stoi(ini.GetValue("Height", "dynamicHeight", "1")) > 0;
 	heightDiffThreshold = std::stof(ini.GetValue("Height", "heightDiffThreshold", "5.0"));
 	heightBuffer = std::stof(ini.GetValue("Height", "heightBuffer", "16.0"));
-	leanCollisionThreshold = std::stof(ini.GetValue("Dev", "leanCollisionThreshold", "0.08"));
 	collisionDevMode = std::stoi(ini.GetValue("Dev", "collisionDevMode", "0")) > 0;
 	buttonDevMode = std::stoi(ini.GetValue("Dev", "buttonDevMode", "0")) > 0;
 	iniDevMode = std::stoi(ini.GetValue("Dev", "iniDevMode", "0")) > 0;
@@ -387,13 +390,8 @@ protected:
 LeanLookHandler::FnOnMouseMoveEvent LeanLookHandler::mouseEvn;
 LeanLookHandler::FnOnThumbstickEvent LeanLookHandler::thumbstickEvn;
 
-void HookedUpdate()
+bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 {
-	typedef void (*FnUpdate)();
-	FnUpdate fn = (FnUpdate)PCUpdateMainThreadOrig;
-	if (fn)
-		(*fn)();
-
 	float curTime = *F4::ptr_engineTime;
 	if (iniDevMode && curTime - lastiniUpdate > 5.0f) {
 		LoadConfigs();
@@ -496,16 +494,12 @@ void HookedUpdate()
 				SetLeanState(0);
 			}
 		}
-
 		if (!isFP && head) {
 			pos = head->world.translate;
 		}
 		if (leanState != 0) {
-			F4::bhkPickData camLeanCheckPick = F4::bhkPickData();
-			GetPickData(pos, pos - right * 30.f * (float)leanState, a, nullptr, camLeanCheckPick);
-			F4::bhkPickData camLeanRevertPick = F4::bhkPickData();
-			GetPickData(pos, pos - right * 22.5f * (float)leanState, a, nullptr, camLeanRevertPick);
-			if (!camLeanCheckPick.HasHit()) {
+			GetPickDataCELL(pos, pos - right * 30.f * (float)leanState, a, *pick);
+			if (!pick->HasHit()) {
 				if (leanState == 1) {
 					leanTime = min(leanTime + deltaTime, leanTimeCost);
 				} else if (leanState == -1) {
@@ -515,7 +509,9 @@ void HookedUpdate()
 				if (collisionDevMode) {
 					_MESSAGE("Camera colliding! No Lean");
 				}
-				if (camLeanRevertPick.HasHit()) {
+				pick->Reset();
+				GetPickDataCELL(pos, pos - right * 22.5f * (float)leanState, a, *pick);
+				if (pick->HasHit()) {
 					if (leanState == 1) {
 						leanTime = max(leanTime - deltaTime, 0);
 					} else if (leanState == -1) {
@@ -536,9 +532,6 @@ void HookedUpdate()
 			leanCumulativeMouseY = 0.f;
 		}
 		float deltaLeanWeight = leanTime / leanTimeCost - leanWeight;
-		if ((leanWeight + deltaLeanWeight > 0 && leanWeight <= 0) || (leanWeight + deltaLeanWeight < 0 && leanWeight >= 0)) {
-			leanDistMoved = 0;
-		}
 		leanWeight += deltaLeanWeight;
 
 		rotZ = isFP ? leanMax * leanWeight : leanMax3rd * leanWeight;
@@ -560,168 +553,172 @@ void HookedUpdate()
 					transDist = isFP ? optimalHeight * sin(leanMax * toRad) : bbx->extents.z * sin(leanMax3rd * toRad);
 					transDist *= pcScale;
 					transX = isFP ? transDist * leanWeight * heightRatio : transDist * leanWeight;
+					hknpDynamicCompoundShape* colShape = (hknpDynamicCompoundShape*)con->shapes[1]._ptr;
 					//_MESSAGE("Optimal height %f", optimalHeight);
 					if (deltaLeanWeight != 0) {
 						if (collisionDevMode) {
 							_MESSAGE("transDist %f", transDist);
 						}
-						hknpShape* colShape = con->shapes[1]._ptr;
 						if (colShape) {
 							float ratio = 1.f + abs(transX) / (bbx->extents.x * pcScale) / 2.f;
 							MultiCompoundShape* multiShape = *(MultiCompoundShape**)((uintptr_t)colShape + 0x60);
 							if (multiShape) {
 								int32_t numShape = *(int32_t*)((uintptr_t)colShape + 0x68);
+								if (collisionDevMode) {
+									_MESSAGE("transDist %f", transDist);
+								}
 								for (int i = 0; i < numShape; ++i) {
 									multiShape->data[i].translate.x = (ratio - 1.f) * Sign(transX) / 2.f;
 									multiShape->data[i].scale.x = ratio;
 								}
 							}
-							/*hknpDynamicCompoundShapeData* shapeData = *(hknpDynamicCompoundShapeData**)((uintptr_t)colShape + 0xC0);
-							if (shapeData) {
-								if (cachedShape[4].size() == 0) {
-									for (int i = 0; i < 8; ++i) {
-										cachedShape[4].push_back(shapeData->bbv->vertex[i]);
-									}
-								}
-								for (int i = 0; i < cachedShape[4].size(); ++i) {
-									shapeData->bbv->vertex[i].x = cachedShape[4][i].x * ratio;
-								}
-							}*/
 						}
-						uintptr_t charProxy = *(uintptr_t*)((uintptr_t)con + 0x470);
-						if (charProxy) {
-							hkTransform* charProxyTransform = (hkTransform*)(charProxy + 0x40);
-							float deltaDist = transDist * deltaLeanWeight / HAVOKTOFO4;
-							F4::bhkPickData pick = F4::bhkPickData();
-							GetPickData(a->data.location + NiPoint3(0, 0, 25.f), a->data.location + NiPoint3(0, 0, 25.f) - right * transDist * Sign(deltaLeanWeight), a, nullptr, pick);
-							bool colDetected = false;
-							hkVector4f displacement = right * -deltaDist;
-							if (!pick.HasHit()) {
-								charProxyTransform->m_translation.v.x += displacement.x;
-								charProxyTransform->m_translation.v.y += displacement.y;
-								charProxyTransform->m_translation.v.z += displacement.z;
+						hkTransform charProxyTransform;
+						con->GetTransformImpl(charProxyTransform);
+						float deltaDist = transDist * deltaLeanWeight / HAVOKTOFO4;
+						pick->Reset();
+						GetPickDataCELL(a->data.location + NiPoint3(0, 0, 25.f), a->data.location + NiPoint3(0, 0, 25.f) - right * transDist * Sign(deltaLeanWeight), a, *pick);
+						hkVector4f displacement = right * -deltaDist;
+						if (!pick->HasHit()) {
+							charProxyTransform.m_translation.v.x += displacement.x;
+							charProxyTransform.m_translation.v.y += displacement.y;
+							charProxyTransform.m_translation.v.z += displacement.z;
+							con->SetTransformImpl(charProxyTransform);
+							if (collisionDevMode) {
+								_MESSAGE("Translating charProxy");
 							}
 						}
 					}
 
 					if (dynamicHeight && !isLoading) {
 						if (abs(height - lastHeight) > heightDiffThreshold) {
-							for (int sn = 0; sn < 2; ++sn) {
-								hknpShape* bumper = con->shapes[sn]._ptr;
-								if (bumper) {
-									CompoundShapeData* data = *(CompoundShapeData**)((uintptr_t)bumper + 0x60);
-									if (data) {
-										data->translate.z = heightRatio - 0.98f;
-										data->scale.z = heightRatio;
-									}
+							if (colShape) {
+								CompoundShapeData* data = *(CompoundShapeData**)((uintptr_t)colShape + 0x60);
+								if (data) {
+									data->translate.z = heightRatio - 0.98f;
+									data->scale.z = heightRatio;
 								}
 							}
 							//_MESSAGE("Changed height");
 							lastHeight = height;
 						}
 					}
+
+					if (colShape) {
+						(*updateAabb)(colShape);
+					}
 				}
 			}
-		}
 
-		NiPoint3 colTransX = NiPoint3(transX, 0, 0);
-		NiNode* comInserted = (NiNode*)tpNode->GetObjectByName("COMInserted");
-		if (comInserted) {
-			comInserted->local.translate = colTransX;
-		}
+			NiPoint3 colTransX = NiPoint3(transX, 0, 0);
+			NiNode* comInserted = (NiNode*)tpNode->GetObjectByName("COMInserted");
+			if (comInserted) {
+				comInserted->local.translate = colTransX;
+			}
 
-		NiNode* cameraInserted = (NiNode*)tpNode->GetObjectByName("CameraInserted");
-		if (cameraInserted) {
-			cameraInserted->local.translate = colTransX;
-		}
+			NiNode* cameraInserted = (NiNode*)tpNode->GetObjectByName("CameraInserted");
+			if (cameraInserted) {
+				cameraInserted->local.translate = colTransX;
+			}
 
-		NiNode* chestInserted = (NiNode*)tpNode->GetObjectByName("ChestInserted");
-		if (chestInserted) {
-			NiMatrix3 rot = chestInserted->parent->world.rotate * GetRotationMatrix33(heading, rotZRadByThree) * Transpose(chestInserted->parent->world.rotate);
-			chestInserted->local.rotate = rot;
-		}
+			NiNode* chestInserted = (NiNode*)tpNode->GetObjectByName("ChestInserted");
+			if (chestInserted) {
+				NiMatrix3 rot = chestInserted->parent->world.rotate * GetRotationMatrix33(heading, rotZRadByThree) * Transpose(chestInserted->parent->world.rotate);
+				chestInserted->local.rotate = rot;
+			}
 
-		NiNode* spine2Inserted = (NiNode*)tpNode->GetObjectByName("Spine2Inserted");
-		if (spine2Inserted) {
-			spine2Inserted->local.rotate = spine2Inserted->parent->world.rotate * GetRotationMatrix33(heading, rotZRadByThree) * Transpose(spine2Inserted->parent->world.rotate);
-			//_MESSAGE("spine1Inserted");
-		}
+			NiNode* spine2Inserted = (NiNode*)tpNode->GetObjectByName("Spine2Inserted");
+			if (spine2Inserted) {
+				spine2Inserted->local.rotate = spine2Inserted->parent->world.rotate * GetRotationMatrix33(heading, rotZRadByThree) * Transpose(spine2Inserted->parent->world.rotate);
+				//_MESSAGE("spine1Inserted");
+			}
 
-		NiNode* spine1Inserted = (NiNode*)tpNode->GetObjectByName("Spine1Inserted");
-		if (spine1Inserted) {
-			spine1Inserted->local.rotate = spine1Inserted->parent->world.rotate * GetRotationMatrix33(heading, rotZRadByThree) * Transpose(spine1Inserted->parent->world.rotate);
-			spine1Inserted->local.translate.z = transZ;
-			//_MESSAGE("spine1Inserted");
-		}
+			NiNode* spine1Inserted = (NiNode*)tpNode->GetObjectByName("Spine1Inserted");
+			if (spine1Inserted) {
+				spine1Inserted->local.rotate = spine1Inserted->parent->world.rotate * GetRotationMatrix33(heading, rotZRadByThree) * Transpose(spine1Inserted->parent->world.rotate);
+				spine1Inserted->local.translate.z = transZ;
+				//_MESSAGE("spine1Inserted");
+			}
 
-		NiNode* pelvisInserted = (NiNode*)tpNode->GetObjectByName("PelvisInserted");
-		if (pelvisInserted) {
-			NiMatrix3 rot = GetRotationMatrix33(rotZRadByThree, 0, 0);
-			pelvisInserted->local.rotate = rot;
-			pelvisInserted->local.translate.z = transZ;
-			//_MESSAGE("pelvisInserted");
-		}
+			NiNode* pelvisInserted = (NiNode*)tpNode->GetObjectByName("PelvisInserted");
+			if (pelvisInserted) {
+				NiMatrix3 rot = GetRotationMatrix33(rotZRadByThree, 0, 0);
+				pelvisInserted->local.rotate = rot;
+				pelvisInserted->local.translate.z = transZ;
+				//_MESSAGE("pelvisInserted");
+			}
 
-		NiNode* llegCalfInserted = (NiNode*)tpNode->GetObjectByName("LLeg_CalfInserted");
-		if (llegCalfInserted) {
-			NiMatrix3 rot = GetRotationMatrix33(-rotZRadByThree, 0, 0);
-			llegCalfInserted->local.rotate = rot;
-			llegCalfInserted->local.translate.z = transZByTwo;
-			//_MESSAGE("llegFootInserted");
-		}
+			NiNode* llegCalfInserted = (NiNode*)tpNode->GetObjectByName("LLeg_CalfInserted");
+			if (llegCalfInserted) {
+				NiMatrix3 rot = GetRotationMatrix33(-rotZRadByThree, 0, 0);
+				llegCalfInserted->local.rotate = rot;
+				llegCalfInserted->local.translate.z = transZByTwo;
+				//_MESSAGE("llegFootInserted");
+			}
 
-		NiNode* rlegCalfInserted = (NiNode*)tpNode->GetObjectByName("RLeg_CalfInserted");
-		if (rlegCalfInserted) {
-			NiMatrix3 rot = GetRotationMatrix33(-rotZRadByThree, 0, 0);
-			rlegCalfInserted->local.rotate = rot;
-			rlegCalfInserted->local.translate.z = transZByTwo;
-			//_MESSAGE("rlegFootInserted");
-		}
+			NiNode* rlegCalfInserted = (NiNode*)tpNode->GetObjectByName("RLeg_CalfInserted");
+			if (rlegCalfInserted) {
+				NiMatrix3 rot = GetRotationMatrix33(-rotZRadByThree, 0, 0);
+				rlegCalfInserted->local.rotate = rot;
+				rlegCalfInserted->local.translate.z = transZByTwo;
+				//_MESSAGE("rlegFootInserted");
+			}
 
-		if (isFP) {
-			NiNode* cameraInserted1st = (NiNode*)node->GetObjectByName("CameraInserted1st");
-			NiNode* camera = (NiNode*)node->GetObjectByName("Camera");
-			if (camera && cameraInserted1st) {
-				if (!leanR6Style) {
-					NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
-					cameraInserted1st->local.translate = colTransX;
-					cameraInserted1st->local.rotate = rot;
-				} else {
-					NiMatrix3 rot = GetRotationMatrix33(-rotZ * toRad, 0, 0);
-					NiPoint3 zoomData = NiPoint3();
-					if (p->currentProcess && p->currentProcess->middleHigh) {
-						BSTArray<EquippedItem> equipped = p->currentProcess->middleHigh->equippedItems;
-						if (equipped.size() != 0 && equipped[0].item.instanceData) {
-							TESObjectWEAP::InstanceData* instance = (TESObjectWEAP::InstanceData*)equipped[0].item.instanceData.get();
-							if (instance->type == 9 && instance->zoomData) {
-								zoomData = instance->zoomData->zoomData.cameraOffset;
+			if (isFP) {
+				NiNode* cameraInserted1st = (NiNode*)node->GetObjectByName("CameraInserted1st");
+				NiNode* camera = (NiNode*)node->GetObjectByName("Camera");
+				if (camera && cameraInserted1st) {
+					if (!leanR6Style) {
+						NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
+						cameraInserted1st->local.translate = colTransX;
+						cameraInserted1st->local.rotate = rot;
+					} else {
+						NiMatrix3 rot = GetRotationMatrix33(-rotZ * toRad, 0, 0);
+						NiPoint3 zoomData = NiPoint3();
+						if (p->currentProcess && p->currentProcess->middleHigh) {
+							BSTArray<EquippedItem> equipped = p->currentProcess->middleHigh->equippedItems;
+							if (equipped.size() != 0 && equipped[0].item.instanceData) {
+								TESObjectWEAP::InstanceData* instance = (TESObjectWEAP::InstanceData*)equipped[0].item.instanceData.get();
+								if (instance->type == 9 && instance->zoomData) {
+									zoomData = instance->zoomData->zoomData.cameraOffset;
+								}
 							}
 						}
+						NiPoint3 camPos = camera->local.translate + zoomData;
+						cameraInserted1st->local.translate = rot * camPos - camPos + colTransX;
+						cameraInserted1st->local.rotate.MakeIdentity();
 					}
-					NiPoint3 camPos = camera->local.translate + zoomData;
-					cameraInserted1st->local.translate = rot * camPos - camPos + colTransX;
-					cameraInserted1st->local.rotate.MakeIdentity();
 				}
-			}
 
-			NiNode* chestInserted1st = (NiNode*)node->GetObjectByName("ChestInserted1st");
-			if (camera && chestInserted1st) {
-				NiMatrix3 rot = chestInserted1st->parent->world.rotate * GetRotationMatrix33(ToRightVector(camera->world.rotate), rotX * toRad) * GetRotationMatrix33(ToUpVector(camera->world.rotate), rotY * toRad) * Transpose(chestInserted1st->parent->world.rotate);  //GetRotationMatrix33(0, rotY * toRad, -rotX * toRad);
-				chestInserted1st->local.rotate = rot;
-			}
+				NiNode* chestInserted1st = (NiNode*)node->GetObjectByName("ChestInserted1st");
+				if (camera && chestInserted1st) {
+					NiMatrix3 rot = chestInserted1st->parent->world.rotate * GetRotationMatrix33(ToRightVector(camera->world.rotate), rotX * toRad) * GetRotationMatrix33(ToUpVector(camera->world.rotate), rotY * toRad) * Transpose(chestInserted1st->parent->world.rotate);  //GetRotationMatrix33(0, rotY * toRad, -rotX * toRad);
+					chestInserted1st->local.rotate = rot;
+				}
 
-			NiNode* comInserted1st = (NiNode*)node->GetObjectByName("COMInserted1st");
-			if (comInserted1st) {
-				NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
-				comInserted1st->local.rotate = rot;
-				comInserted1st->local.translate = colTransX;
-				//_MESSAGE("comInserted");
+				NiNode* comInserted1st = (NiNode*)node->GetObjectByName("COMInserted1st");
+				if (comInserted1st) {
+					NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
+					comInserted1st->local.rotate = rot;
+					comInserted1st->local.translate = colTransX;
+					//_MESSAGE("comInserted");
+				}
 			}
 		}
 	} else {
 		SetLeanState(0);
 	}
 	lastRun = curTime;
+
+	/*typedef void (*FnUpdate)();
+	FnUpdate fn = (FnUpdate)PCUpdateMainThreadOrig;
+	if (fn)
+		(*fn)();*/
+	typedef bool (*FnUpdate)(bhkWorld*, uint32_t);
+	FnUpdate fn = (FnUpdate)bhkWorldUpdateOrig;
+	if (fn)
+		return (*fn)(world, destroy);
+	return false;
 }
 
 class InputEventReceiverOverride : public BSInputEventReceiver
@@ -893,6 +890,18 @@ void InitializePlugin()
 	ObjectLoadedEventSource::GetSingleton()->RegisterSink(olw);
 	MenuWatcher* mw = new MenuWatcher();
 	UI::GetSingleton()->GetEventSource<MenuOpenCloseEvent>()->RegisterSink(mw);
+	pick = new F4::bhkPickData();
+
+	/*bool succ = PCUpdatePickRefHook.Create((LPVOID)(ptr_PCUpdatePickRef.address()), HookedUpdate);
+	if (succ) {
+		PCUpdatePickRefOrig = (uintptr_t)PCUpdatePickRefHook.GetTrampoline();
+		_MESSAGE("Detour success. Addr %llx Orig %llx", ptr_PCUpdatePickRef.address(), PCUpdatePickRefOrig);
+	}*/
+	bool succ = bhkWorldUpdateHook.Create((LPVOID)(ptr_bhkWorldUpdate.address()), HookedUpdate);
+	if (succ) {
+		bhkWorldUpdateOrig = (uintptr_t)bhkWorldUpdateHook.GetTrampoline();
+		_MESSAGE("Detour success. Addr %llx Orig %llx", ptr_bhkWorldUpdate.address(), bhkWorldUpdateOrig);
+	}
 }
 
 #pragma endregion
@@ -940,7 +949,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 		return false;
 	}
 
-	F4SE::AllocTrampoline(8 * 8);
+	//F4SE::AllocTrampoline(8 * 8);
 
 	return true;
 }
@@ -949,8 +958,8 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 {
 	F4SE::Init(a_f4se);
 
-	F4SE::Trampoline& trampoline = F4SE::GetTrampoline();
-	PCUpdateMainThreadOrig = trampoline.write_call<5>(ptr_PCUpdateMainThread.address(), &HookedUpdate);
+	//F4SE::Trampoline& trampoline = F4SE::GetTrampoline();
+	//PCUpdateMainThreadOrig = trampoline.write_call<5>(ptr_PCUpdateMainThread.address(), &HookedUpdate);
 	//UpdateSceneGraphOrig = trampoline.write_call<5>(ptr_UpdateSceneGraph.address(), &HookedUpdateSceneGraph);
 
 	const F4SE::MessagingInterface* message = F4SE::GetMessagingInterface();
