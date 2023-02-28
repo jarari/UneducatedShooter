@@ -22,11 +22,14 @@ REL::Relocation<_updateAabb*> updateAabb{ VTABLE::hknpDynamicCompoundShape[0], 0
 REL::Relocation<uintptr_t> ptr_ADS_DistanceCheck{ REL::ID(1278889), 0x31 };
 /*REL::Relocation<uintptr_t> ptr_PCUpdateMainThread{REL::ID(633524), 0x22D};
 static uintptr_t PCUpdateMainThreadOrig;
-REL::Relocation<uintptr_t> ptr_UpdateSceneGraph{ REL::ID(1318162), 0xD5 };
+REL::Relocation<uintptr_t> ptr_UpdateSceneGraph{REL::ID(1318162), 0xD5};
 static uintptr_t UpdateSceneGraphOrig;*/
+REL::Relocation<uintptr_t> ptr_RunActorUpdates{ REL::ID(556439), 0x17 };
+uintptr_t RunActorUpdatesOrig;
 REL::Relocation<uintptr_t> ptr_bhkWorldUpdate{ REL::ID(1395106) };
 static uintptr_t bhkWorldUpdateOrig;
 DetourXS bhkWorldUpdateHook;
+const F4SE::TaskInterface* taskInterface;
 //vector<hkVector4f> cachedShape[5];
 CSimpleIniA ini(true, true, false);
 PlayerCharacter* p;
@@ -54,6 +57,7 @@ float rotReturnDivMin = 1.02f;
 bool rotDisableInADS = false;
 float lastRun;
 float playerLastLoaded;
+float lastSkeletonUpdate;
 int leanState = 0;
 int lastLeanState = 0;
 float leanWeight;
@@ -89,15 +93,6 @@ bool inPipboyMenu = false;
 
 #pragma region Utilities
 
-void NiSetParent(NiAVObject* node, NiNode* parent)
-{
-	NiNode* oldParent = node->parent;
-	if (oldParent) {
-		oldParent->DetachChild(node);
-	}
-	node->parent = parent;
-}
-
 NiNode* InsertBone(NiAVObject* root, NiNode* node, const char* name)
 {
 	NiNode* parent = node->parent;
@@ -106,7 +101,6 @@ NiNode* InsertBone(NiAVObject* root, NiNode* node, const char* name)
 		inserted = CreateBone(name);
 		//_MESSAGE("%s (%llx) created.", name, inserted);
 		if (parent) {
-			parent->DetachChild(node);
 			parent->AttachChild(inserted, true);
 			inserted->parent = parent;
 		} else {
@@ -119,20 +113,16 @@ NiNode* InsertBone(NiAVObject* root, NiNode* node, const char* name)
 		return inserted;
 	} else {
 		if (!inserted->GetObjectByName(node->name)) {
-			_MESSAGE("%s structure mismatch. Reinserting...", inserted->name.c_str());
-			inserted->parent->DetachChild(inserted);
-			inserted = CreateBone(name);
+			_MESSAGE("%s structure mismatch. Reinserting... (%f)", inserted->name.c_str(), *F4::ptr_engineTime);
 			//_MESSAGE("%s (%llx) created.", name, inserted);
 			if (parent) {
-				parent->DetachChild(node);
 				parent->AttachChild(inserted, true);
 				inserted->parent = parent;
 			} else {
 				parent = node;
 			}
-			inserted->local.translate = NiPoint3();
-			inserted->local.rotate.MakeIdentity();
 			inserted->AttachChild(node, true);
+			return inserted;
 		}
 	}
 	return nullptr;
@@ -242,10 +232,10 @@ void LoadConfigs()
 	}
 }
 
-void PreparePlayerSkeleton()
+void PreparePlayerSkeleton(NiAVObject* node = nullptr)
 {
 	NiAVObject* fpNode = p->Get3D(true);
-	if (fpNode) {
+	if (fpNode && (!node || node == fpNode)) {
 		//_MESSAGE("First person skeleton found.");
 
 		NiNode* chest = (NiNode*)fpNode->GetObjectByName("Chest");
@@ -264,7 +254,7 @@ void PreparePlayerSkeleton()
 		}
 	}
 	NiAVObject* tpNode = p->Get3D(false);
-	if (tpNode) {
+	if (tpNode && (!node || node == tpNode)) {
 		//_MESSAGE("Third person skeleton found.");
 
 		NiNode* com = (NiNode*)tpNode->GetObjectByName("COM");
@@ -404,12 +394,6 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 		NiNode* head = (NiNode*)tpNode->GetObjectByName("HEAD");
 		NiNode* pelvis = (NiNode*)tpNode->GetObjectByName("Pelvis");
 		NiNode* root = (NiNode*)tpNode->GetObjectByName("Root");
-		if (node != lastRoot) {
-			bbx = (BSBound*)tpNode->GetExtraData("BBX");
-			//_MESSAGE("tpNode %llx", tpNode);
-			lastRoot = node->IsNode();
-			PreparePlayerSkeleton();
-		}
 		float deltaTime = min(curTime - lastRun, 5.0f);
 		float timeMult = deltaTime * 60.0f;
 		bool isFP = IsFirstPerson();
@@ -559,18 +543,13 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 						if (collisionDevMode) {
 							_MESSAGE("transDist %f", transDist);
 						}
-						if (colShape) {
+						if (a->interactingState == INTERACTING_STATE::kNotInteracting && colShape) {
 							float ratio = 1.f + abs(transX) / (bbx->extents.x * pcScale) / 2.f;
 							MultiCompoundShape* multiShape = *(MultiCompoundShape**)((uintptr_t)colShape + 0x60);
 							if (multiShape) {
 								int32_t numShape = *(int32_t*)((uintptr_t)colShape + 0x68);
-								if (collisionDevMode) {
-									_MESSAGE("transDist %f", transDist);
-								}
-								for (int i = 0; i < numShape; ++i) {
-									multiShape->data[i].translate.x = (ratio - 1.f) * Sign(transX) / 2.f;
-									multiShape->data[i].scale.x = ratio;
-								}
+								multiShape->data[0].translate.x = (ratio - 1.f) * Sign(transX) / 2.f;
+								multiShape->data[0].scale.x = ratio;
 							}
 						}
 						hkTransform charProxyTransform;
@@ -709,16 +688,31 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 		SetLeanState(0);
 	}
 	lastRun = curTime;
-
-	/*typedef void (*FnUpdate)();
-	FnUpdate fn = (FnUpdate)PCUpdateMainThreadOrig;
-	if (fn)
-		(*fn)();*/
 	typedef bool (*FnUpdate)(bhkWorld*, uint32_t);
 	FnUpdate fn = (FnUpdate)bhkWorldUpdateOrig;
 	if (fn)
 		return (*fn)(world, destroy);
 	return false;
+}
+
+void HookedActorUpdate(F4::ProcessLists* list, float deltaTime, bool instant)
+{
+	float curTime = *F4::ptr_engineTime;
+	if (curTime - lastSkeletonUpdate > 1.f) {
+		PreparePlayerSkeleton(p->Get3D());
+		lastSkeletonUpdate = curTime;
+	}
+	NiAVObject* node = p->Get3D();
+	if (node && node != lastRoot) {
+		bbx = (BSBound*)p->Get3D(false)->GetExtraData("BBX");
+		lastRoot = node->IsNode();
+		PreparePlayerSkeleton();
+	}
+
+	typedef void (*FnUpdate)(F4::ProcessLists*, float, bool);
+	FnUpdate fn = (FnUpdate)RunActorUpdatesOrig;
+	if (fn)
+		(*fn)(list, deltaTime, instant);
 }
 
 class InputEventReceiverOverride : public BSInputEventReceiver
@@ -821,6 +815,7 @@ public:
 			if (evn.formId == 0x14) {
 				_MESSAGE("Player loaded");
 				playerLastLoaded = *F4::ptr_engineTime;
+				lastSkeletonUpdate = *F4::ptr_engineTime;
 				PreparePlayerSkeleton();
 			}
 		}
@@ -949,7 +944,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 		return false;
 	}
 
-	//F4SE::AllocTrampoline(8 * 8);
+	F4SE::AllocTrampoline(8 * 8);
 
 	return true;
 }
@@ -958,9 +953,12 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 {
 	F4SE::Init(a_f4se);
 
-	//F4SE::Trampoline& trampoline = F4SE::GetTrampoline();
-	//PCUpdateMainThreadOrig = trampoline.write_call<5>(ptr_PCUpdateMainThread.address(), &HookedUpdate);
+	F4SE::Trampoline& trampoline = F4SE::GetTrampoline();
+	RunActorUpdatesOrig = trampoline.write_call<5>(ptr_RunActorUpdates.address(), &HookedActorUpdate);
+	//PCUpdateMainThreadOrig = trampoline.write_call<5>(ptr_PCUpdateMainThread.address(), &HookedPCUpdate);
 	//UpdateSceneGraphOrig = trampoline.write_call<5>(ptr_UpdateSceneGraph.address(), &HookedUpdateSceneGraph);
+
+	taskInterface = F4SE::GetTaskInterface();
 
 	const F4SE::MessagingInterface* message = F4SE::GetMessagingInterface();
 	message->RegisterListener([](F4SE::MessagingInterface::Message* msg) -> void {
