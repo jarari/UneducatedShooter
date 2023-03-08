@@ -35,7 +35,7 @@ CSimpleIniA ini(true, true, false);
 PlayerCharacter* p;
 PlayerCamera* pcam;
 PlayerControls* pc;
-F4::bhkPickData* pick;
+bhkPickData* pick;
 NiNode* lastRoot;
 BSBound* bbx;
 ActorValueInfo* rightAttackCondition;
@@ -225,7 +225,7 @@ void LoadConfigs()
 		for (auto it = GameSettingCollection::GetSingleton()->settings.begin(); it != GameSettingCollection::GetSingleton()->settings.end(); ++it) {
 			if (it->first == "fPlayerCoverPeekTime") {
 				it->second->SetFloat(0.0f);
-				_MESSAGE("%s changed to %f", it->first.c_str(), it->second->_value);
+				_MESSAGE("%s changed to %f", it->first.c_str(), it->second->GetFloat());
 			}
 		}
 		vanillaPeekPatched = true;
@@ -655,13 +655,15 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 						NiMatrix3 rot = GetRotationMatrix33(-rotZ * toRad, 0, 0);
 						NiPoint3 zoomData = NiPoint3();
 						if (p->currentProcess && p->currentProcess->middleHigh) {
-							BSTArray<EquippedItem> equipped = p->currentProcess->middleHigh->equippedItems;
+							p->currentProcess->middleHigh->equippedItemsLock.lock();
+							BSTArray<EquippedItem>& equipped = p->currentProcess->middleHigh->equippedItems;
 							if (equipped.size() != 0 && equipped[0].item.instanceData) {
 								TESObjectWEAP::InstanceData* instance = (TESObjectWEAP::InstanceData*)equipped[0].item.instanceData.get();
-								if (instance->type == 9 && instance->zoomData) {
+								if (instance->type == WEAPON_TYPE::kGun && instance->zoomData) {
 									zoomData = instance->zoomData->zoomData.cameraOffset;
 								}
 							}
+							p->currentProcess->middleHigh->equippedItemsLock.unlock();
 						}
 						NiPoint3 camPos = camera->local.translate + zoomData;
 						cameraInserted1st->local.translate = rot * camPos - camPos + colTransX;
@@ -885,7 +887,7 @@ void InitializePlugin()
 	ObjectLoadedEventSource::GetSingleton()->RegisterSink(olw);
 	MenuWatcher* mw = new MenuWatcher();
 	UI::GetSingleton()->GetEventSource<MenuOpenCloseEvent>()->RegisterSink(mw);
-	pick = new F4::bhkPickData();
+	pick = new bhkPickData();
 
 	/*bool succ = PCUpdatePickRefHook.Create((LPVOID)(ptr_PCUpdatePickRef.address()), HookedUpdate);
 	if (succ) {
