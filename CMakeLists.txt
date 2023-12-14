@@ -176,6 +176,7 @@ target_link_libraries(
 	PRIVATE
 		CommonLibF4::CommonLibF4
 		spdlog::spdlog
+		nlohmann_json::nlohmann_json
 #		${HAVOK_BASE}
 #		${HAVOK_COMPAT}
 #		${HAVOK_PHYSICS}

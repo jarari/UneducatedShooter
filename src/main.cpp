@@ -1,4 +1,3 @@
-#include <DetourXS/detourxs.h>
 #include <Havok.h>
 #include <MathUtils.h>
 #include <SimpleIni.h>
@@ -6,6 +5,9 @@
 #include <Windows.h>
 #include <unordered_map>
 #include <vector>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <Xinput.h>
 using namespace F4SE;
 #define MATH_PI 3.14159265358979323846
 #define HAVOKTOFO4 69.99124f
@@ -27,11 +29,8 @@ static uintptr_t UpdateSceneGraphOrig;*/
 REL::Relocation<uintptr_t> ptr_RunActorUpdates{ REL::ID(556439), 0x17 };
 uintptr_t RunActorUpdatesOrig;
 REL::Relocation<uintptr_t> ptr_bhkWorldUpdate{ REL::ID(1395106) };
-static uintptr_t bhkWorldUpdateOrig;
-DetourXS bhkWorldUpdateHook;
 const F4SE::TaskInterface* taskInterface;
 //vector<hkVector4f> cachedShape[5];
-CSimpleIniA ini(true, true, false);
 PlayerCharacter* p;
 PlayerCamera* pcam;
 PlayerControls* pc;
@@ -71,27 +70,137 @@ NiPoint3 leanLastDir;
 bool toggleLean = false;
 bool disableLean = false;
 bool vanillaPeekPatched = false;
-uint32_t leanLeft = 0x51;
-uint32_t leanRight = 0x45;
+uint32_t leanLeft = 0xFFFF;
+uint32_t leanRight = 0xFFFF;
 bool leanADSOnly = false;
 bool leanR6Style = false;
+bool leanRotateInput = false;
 bool collisionDevMode = false;
 bool buttonDevMode = false;
-bool iniDevMode = false;
 float lastiniUpdate;
 float lastHeight = 120.0f;
 float heightDiffThreshold = 5.0f;
 float heightBuffer = 16.0f;
+float minHeight = 20.f;
 bool dynamicHeight = false;
+float realismDefaultRot = 12.f;
+float realismRatio = 1.f;
+float realismYawRatio = 0.8f;
+float realismRatioADSMult = 0.2f;
+float realismRotLimit = 30.f;
+float realismYawRotLimit = 7.5f;
+float realismReturnStep = 0.0001f;
+float realismReturnStepADSMult = 4.f;
+float realismElasticity = 0.3f;
+float realismWeight, realismWeightNoElastic, realismWeightSpring, realismRotZ, realismRotX, realismReturnStepWeight;
+bool realismDisableInPA = false;
+bool realism = false;
 bool isLoading = false;
 bool inWorkShopMenu = false;
 bool inLooksMenu = false;
 bool inDialogueMenu = false;
 bool inPipboyMenu = false;
 
+#define REALISM_RATIO_CONSTANT 0.45f
+#define REALISM_RETURNWEIGHT_START 0.75f
+#define REALISM_RETURNWEIGHT_TIME 0.1f
+
 #pragma endregion
 
 #pragma region Utilities
+
+namespace Translation
+{
+	uint32_t ReadLine_w(BSResourceNiBinaryStream& stream, wchar_t* dst, uint32_t dstLen, uint32_t terminator)
+	{
+		wchar_t* iter = dst;
+
+		if (dstLen == 0)
+			return 0;
+
+		for (uint32_t i = 0; i < dstLen - 1; i++) {
+			wchar_t data;
+
+			if (stream.binary_read(&data, sizeof(data)) != sizeof(data))
+				break;
+
+			if (data == terminator)
+				break;
+
+			*iter++ = data;
+		}
+
+		// null terminate
+		*iter = 0;
+
+		return iter - dst;
+	}
+
+	void ParseTranslation(BSScaleformTranslator* translator, std::string name)
+	{
+		Setting* setting = INISettingCollection::GetSingleton()->GetSetting("sLanguage:General");
+		if (!setting)
+			setting = INIPrefSettingCollection::GetSingleton()->GetSetting("sLanguage:General");
+		std::string path = "Interface\\Translations\\";
+
+		// Construct translation filename
+		path += name;
+		path += "_";
+		path += (setting && setting->GetType() == Setting::SETTING_TYPE::kString) ? setting->GetString() : "en";
+		path += ".txt";
+
+		BSResourceNiBinaryStream fileStream(path.c_str());
+		_MESSAGE("Loading translations %s", path.c_str());
+
+		// Check if file is empty, if not check if the BOM is UTF-16
+		uint16_t bom = 0;
+		uint32_t ret = (uint32_t)fileStream.binary_read(&bom, sizeof(uint16_t));
+		if (ret == 0) {
+			_MESSAGE("Empty translation file.");
+			return;
+		}
+		if (bom != 0xFEFF) {
+			_MESSAGE("BOM Error, file must be encoded in UCS-2 LE.");
+			return;
+		}
+
+		while (true) {
+			wchar_t buf[512];
+			uint32_t len = ReadLine_w(fileStream, buf, sizeof(buf) / sizeof(buf[0]), '\n');
+			if (len == 0)  // End of file
+				return;
+
+			// at least $ + wchar_t + \t + wchar_t
+			if (len < 4 || buf[0] != '$')
+				continue;
+
+			wchar_t last = buf[len - 1];
+			if (last == '\r')
+				len--;
+
+			// null terminate
+			buf[len] = 0;
+
+			uint32_t delimIdx = 0;
+			for (uint32_t i = 0; i < len; i++)
+				if (buf[i] == '\t')
+					delimIdx = i;
+
+			// at least $ + wchar_t
+			if (delimIdx < 2)
+				continue;
+
+			// replace \t by \0
+			buf[delimIdx] = 0;
+
+			BSFixedStringWCS key(buf);
+			BSFixedStringWCS translation(&buf[delimIdx + 1]);
+
+			BSTTuple<BSFixedStringWCS, BSFixedStringWCS> item(key, translation);
+			translator->translator.translationMap.insert(item);
+		}
+	}
+}
 
 NiNode* InsertBone(NiAVObject* root, NiNode* node, const char* name)
 {
@@ -153,71 +262,82 @@ float Sign(float f)
 	return abs(f) / f;
 }
 
-enum NiAVObjectFlag
-{
-	kNone = 0,
-	kHidden = 1 << 0,
-	kSelectiveUpdate = 1 << 1,
-	kSelectiveUpdateTransforms = 1 << 2,
-	kSelectiveUpdateController = 1 << 3,
-	kSelectiveUpdateRigid = 1 << 4,
-	kDisplayObject = 1 << 5,
-	kDisableSorting = 1 << 6,
-	kSelectiveUpdateTransformsOverride = 1 << 7,
-	kSaveExternalGeometryData = 1 << 9,
-	kNoDecals = 1 << 10,
-	kAlwaysDraw = 1 << 11,
-	kMeshLOD = 1 << 12,
-	kFixedBound = 1 << 13,
-	kTopFadeNode = 1 << 14,
-	kIgnoreFade = 1 << 15,
-	kNoAnimSyncX = 1 << 16,
-	kNoAnimSyncY = 1 << 17,
-	kNoAnimSyncZ = 1 << 18,
-	kNoAnimSyncS = 1 << 19,
-	kNoDismember = 1 << 20,
-	kNoDismemberValidity = 1 << 21,
-	kRenderUse = 1 << 22,
-	kMaterialsApplied = 1 << 23,
-	kHighDetail = 1 << 24,
-	kForceUpdate = 1 << 25,
-	kPreProcessedNode = 1 << 26
-};
-
 #pragma endregion
 
 #pragma region Functions
 
 void LoadConfigs()
 {
-	ini.LoadFile("Data\\F4SE\\Plugins\\UneducatedShooter.ini");
-	rotLimitX = std::stof(ini.GetValue("Inertia", "rotLimitX", "16.0"));
-	rotLimitY = std::stof(ini.GetValue("Inertia", "rotLimitY", "8.0"));
-	rotDivX = std::stof(ini.GetValue("Inertia", "rotDivX", "4.0"));
-	rotDivY = std::stof(ini.GetValue("Inertia", "rotDivY", "4.0"));
-	rotDivXADS = std::stof(ini.GetValue("Inertia", "rotDivXADS", "12.0"));
-	rotDivYADS = std::stof(ini.GetValue("Inertia", "rotDivYADS", "12.0"));
-	rotADSConditionMult = std::stof(ini.GetValue("Inertia", "rotADSConditionMult", "4.0"));
-	rotReturnDiv = std::stof(ini.GetValue("Inertia", "rotReturnDiv", "2.0"));
-	rotReturnDivMin = std::stof(ini.GetValue("Inertia", "rotReturnDivMin", "1.05"));
-	rotReturnStep = std::stof(ini.GetValue("Inertia", "rotReturnStep", "0.0"));
-	rotDisableInADS = std::stoi(ini.GetValue("Inertia", "rotDisableInADS", "0")) > 0;
-	disableLean = std::stoi(ini.GetValue("Leaning", "leanDisable", "0")) > 0;
-	leanTimeCost = std::stof(ini.GetValue("Leaning", "leanTimeCost", "1.0"));
-	leanMax = std::stof(ini.GetValue("Leaning", "leanMax", "15.0"));
-	leanMax3rd = std::stof(ini.GetValue("Leaning", "leanMax3rd", "30.0"));
-	toggleLean = std::stoi(ini.GetValue("Leaning", "ToggleLean", "0")) > 0;
-	leanLeft = std::stoi(ini.GetValue("Leaning", "LeanLeft", "0x51"), 0, 16);
-	leanRight = std::stoi(ini.GetValue("Leaning", "LeanRight", "0x45"), 0, 16);
-	leanADSOnly = std::stoi(ini.GetValue("Leaning", "ADSOnly", "0")) > 0;
-	leanR6Style = std::stoi(ini.GetValue("Leaning", "R6Style", "0")) > 0;
-	dynamicHeight = std::stoi(ini.GetValue("Height", "dynamicHeight", "1")) > 0;
-	heightDiffThreshold = std::stof(ini.GetValue("Height", "heightDiffThreshold", "5.0"));
-	heightBuffer = std::stof(ini.GetValue("Height", "heightBuffer", "16.0"));
-	collisionDevMode = std::stoi(ini.GetValue("Dev", "collisionDevMode", "0")) > 0;
-	buttonDevMode = std::stoi(ini.GetValue("Dev", "buttonDevMode", "0")) > 0;
-	iniDevMode = std::stoi(ini.GetValue("Dev", "iniDevMode", "0")) > 0;
+	std::string path = "Data\\MCM\\Config\\UneducatedShooter\\settings.ini";
+	if (std::filesystem::exists(path)) {
+		path = "Data\\MCM\\Settings\\UneducatedShooter.ini";
+	}
+	CSimpleIniA ini(true, false, false);
+	SI_Error result = ini.LoadFile(path.c_str());
+	if (result >= 0) {
+		rotLimitX = std::stof(ini.GetValue("Inertia", "frotLimitX", "24.0"));
+		rotLimitY = std::stof(ini.GetValue("Inertia", "frotLimitY", "8.0"));
+		rotDivX = std::stof(ini.GetValue("Inertia", "frotDivX", "24.0"));
+		rotDivY = std::stof(ini.GetValue("Inertia", "frotDivY", "32.0"));
+		rotDivXADS = std::stof(ini.GetValue("Inertia", "frotDivXADS", "24.0"));
+		rotDivYADS = std::stof(ini.GetValue("Inertia", "frotDivYADS", "32.0"));
+		rotADSConditionMult = std::stof(ini.GetValue("Inertia", "frotADSConditionMult", "3.0"));
+		rotReturnDiv = std::stof(ini.GetValue("Inertia", "frotReturnDiv", "1.25"));
+		//rotReturnDivMin = std::stof(ini.GetValue("Inertia", "frotReturnDivMin", "1.05"));
+		rotReturnDivMin = 1.12f;
+		rotReturnStep = std::stof(ini.GetValue("Inertia", "frotReturnStep", "0.0"));
+		rotDisableInADS = std::stoi(ini.GetValue("Inertia", "brotDisableInADS", "0")) > 0;
+		realismDefaultRot = std::stof(ini.GetValue("Realism", "fRealismDefaultRotation", "-2.5"));
+		realismRatio = std::stof(ini.GetValue("Realism", "fRealismRatio", "1.2"));
+		realismYawRatio = std::stof(ini.GetValue("Realism", "realismYawRatio", "0.8"));
+		realismRatioADSMult = std::stof(ini.GetValue("Realism", "fRealismRatioADS", "0.2"));
+		realismRotLimit = std::stof(ini.GetValue("Realism", "fRealismRotLimit", "10.0"));
+		realismYawRotLimit = std::stof(ini.GetValue("Realism", "fRealismYawRotLimit", "12.5"));
+		realismReturnStep = std::stof(ini.GetValue("Realism", "fRealismReturnStep", "0.05"));
+		realismReturnStepADSMult = std::stof(ini.GetValue("Realism", "fRealismReturnStepADS", "4.0"));
+		//realismElasticity = std::stof(ini.GetValue("Realism", "fRealismElasticity", "0.3"));
+		realismElasticity = 0.f;
+		realismDisableInPA = std::stoi(ini.GetValue("Realism", "bRealismDisableInPA", "0")) > 0;
+		realism = std::stoi(ini.GetValue("Realism", "bRealism", "0")) > 0;
+		disableLean = std::stoi(ini.GetValue("Leaning", "bleanDisable", "0")) > 0;
+		leanTimeCost = std::stof(ini.GetValue("Leaning", "fleanTimeCost", "0.2"));
+		leanMax = std::stof(ini.GetValue("Leaning", "fleanMax", "15.0"));
+		leanMax3rd = std::stof(ini.GetValue("Leaning", "fleanMax3rd", "30.0"));
+		toggleLean = std::stoi(ini.GetValue("Leaning", "bToggleLean", "1")) > 0;
+		leanADSOnly = std::stoi(ini.GetValue("Leaning", "bADSOnly", "0")) > 0;
+		leanR6Style = std::stoi(ini.GetValue("Leaning", "bR6Style", "0")) > 0;
+		leanRotateInput = std::stoi(ini.GetValue("Leaning", "bRotateInput", "1")) > 0;
+		dynamicHeight = std::stoi(ini.GetValue("Height", "bdynamicHeight", "1")) > 0;
+		heightDiffThreshold = std::stof(ini.GetValue("Height", "fheightDiffThreshold", "5.0"));
+		heightBuffer = std::stof(ini.GetValue("Height", "fheightBuffer", "4.0"));
+		minHeight = std::stof(ini.GetValue("Height", "fminHeight", "20.0"));
+		collisionDevMode = std::stoi(ini.GetValue("Dev", "bcollisionDevMode", "0")) > 0;
+		buttonDevMode = std::stoi(ini.GetValue("Dev", "bbuttonDevMode", "0")) > 0;
+	}
 	ini.Reset();
+	std::string hotkeyPath = "Data\\MCM\\Settings\\Keybinds.json";
+	if (std::filesystem::exists(hotkeyPath)) {
+		std::ifstream reader;
+		reader.open(hotkeyPath);
+		nlohmann::json keyBinds;
+		reader >> keyBinds;
+		reader.close();
+		if (keyBinds.contains("keybinds")) {
+			for (auto& key : keyBinds["keybinds"]) {
+				try {
+					if (key["modName"].get<std::string>() == "UneducatedShooter") {
+						if (key["id"].get<std::string>() == "keyLeanLeft") {
+							leanLeft = key["keycode"].get<int>();
+						} else if (key["id"].get<std::string>() == "keyLeanRight") {
+							leanRight = key["keycode"].get<int>();
+						}
+					}
+				} catch (...) {
+					continue;
+				}
+			}
+		}
+	}
 
 	if (!vanillaPeekPatched && !disableLean) {
 		uint8_t bytes[] = { 0xE9, 0x1C, 0x06, 0x00, 0x00, 0x90 };
@@ -342,7 +462,7 @@ public:
 
 	void HookedMouseMoveEvent(MouseMoveEvent* evn)
 	{
-		if (pcam->currentState == pcam->cameraStates[CameraState::kFirstPerson] && !leanR6Style) {
+		if (pcam->currentState == pcam->cameraStates[CameraState::kFirstPerson] && !leanR6Style && leanRotateInput) {
 			std::vector<float> input;
 			RotateXY((float)evn->mouseInputX, (float)evn->mouseInputY, -rotZ * toRad, input);
 			leanCumulativeMouseX += input[0];
@@ -357,7 +477,7 @@ public:
 
 	void HookedThumbstickEvent(ThumbstickEvent* evn)
 	{
-		if (evn->idCode == ThumbstickEvent::kRight && pcam->currentState == pcam->cameraStates[CameraState::kFirstPerson] && !leanR6Style) {
+		if (evn->idCode == ThumbstickEvent::kRight && pcam->currentState == pcam->cameraStates[CameraState::kFirstPerson] && !leanR6Style && leanRotateInput) {
 			std::vector<float> input;
 			RotateXY(evn->xValue, -evn->yValue, -rotZ * toRad, input);
 			evn->xValue = input[0];
@@ -380,22 +500,33 @@ protected:
 LeanLookHandler::FnOnMouseMoveEvent LeanLookHandler::mouseEvn;
 LeanLookHandler::FnOnThumbstickEvent LeanLookHandler::thumbstickEvn;
 
-bool HookedUpdate(bhkWorld* world, uint32_t destroy)
+void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 {
 	float curTime = *F4::ptr_engineTime;
-	if (iniDevMode && curTime - lastiniUpdate > 5.0f) {
-		LoadConfigs();
-		lastiniUpdate = curTime;
+	if (curTime - lastSkeletonUpdate > 1.f) {
+		PreparePlayerSkeleton(p->Get3D());
+		lastSkeletonUpdate = curTime;
 	}
+	NiAVObject* node = p->Get3D();
+	if (node && node != lastRoot) {
+		bbx = (BSBound*)p->Get3D(false)->GetExtraData("BBX");
+		lastRoot = node->IsNode();
+		PreparePlayerSkeleton();
+	}
+
+	typedef void (*FnUpdate)(F4::ProcessLists*, float, bool);
+	FnUpdate fn = (FnUpdate)RunActorUpdatesOrig;
+	if (fn)
+		(*fn)(list, dt, instant);
+
 	Actor* a = p;
-	NiAVObject* node = a->Get3D();
 	NiAVObject* tpNode = a->Get3D(false);
-	if (node && tpNode && (a->moreFlags & 0x20) == 0 && a->GetObjectReference()->formID == 0x7) {
+	if (node && tpNode && (a->moreFlags & 0x20) == 0) {
 		NiNode* head = (NiNode*)tpNode->GetObjectByName("HEAD");
 		NiNode* pelvis = (NiNode*)tpNode->GetObjectByName("Pelvis");
 		NiNode* root = (NiNode*)tpNode->GetObjectByName("Root");
 		float deltaTime = min(curTime - lastRun, 5.0f);
-		float timeMult = deltaTime * 60.0f;
+		float timeMult = deltaTime * 30.0f;
 		bool isFP = IsFirstPerson();
 		float pcScale = GetActorScale(p);
 		float heightRatio = 1;
@@ -413,6 +544,11 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 			con = a->currentProcess->middleHigh->charController.get();
 		}
 
+		float eulerX, eulerY, eulerZ;
+		NiMatrix3 playerRot = GetRotationMatrix33(0, -a->data.angle.x, -a->data.angle.z);
+		(playerRot * Transpose(lastCamRot)).ToEulerAnglesXYZ(eulerX, eulerY, eulerZ);
+		lastCamRot = playerRot;
+
 #pragma region Inertia
 		float tempRotDivX = rotDivX;
 		float tempRotDivY = rotDivY;
@@ -429,10 +565,8 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 			tempRotDivY = rotDivYADS;
 		}
 		float step = rotReturnStep * conditionalMultiplier * timeMult;
-		float retDiv = max(pow(rotReturnDiv * conditionalMultiplier, timeMult), rotReturnDivMin);
-		float followDiv = max(pow(3.0f, timeMult), 1.0f);
-		float eulerX, eulerY, eulerZ;
-		(pcam->cameraRoot->world.rotate * Transpose(lastCamRot)).ToEulerAnglesXYZ(eulerX, eulerY, eulerZ);
+		float retDiv = pow(pow(max(rotReturnDiv * conditionalMultiplier, rotReturnDivMin), 30.f), deltaTime);
+		float followDiv = pow(pow(3.0f, 30.f), deltaTime);
 		targetRotZ -= eulerZ / toRad / tempRotDivY * 5.f;
 		targetRotX -= eulerX / toRad / tempRotDivX * 5.f;
 		rotX += (targetRotX - rotX) / followDiv;
@@ -441,7 +575,6 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 		rotY = max(min(rotY, rotLimitY), -rotLimitY);
 		targetRotZ /= retDiv;
 		targetRotX /= retDiv;
-		lastCamRot = pcam->cameraRoot->world.rotate;
 		//_MESSAGE("retDiv %f rotX %f rotY %f", retDiv, rotX, rotY);
 		if (abs(rotX) * (abs(rotX) - step) <= 0) {
 			rotX = 0;
@@ -461,13 +594,77 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 				rotY += step;
 			}
 		}
-		if ((IsInADS(a) && rotDisableInADS) || inPipboyMenu) {
+#pragma endregion
+
+#pragma region Realism
+
+		if (realism && (!realismDisableInPA || !IsInPowerArmor(a))) {
+			float tempRealismRatio = realismRatio;
+			float tempRealismYawRatio = realismYawRatio;
+			float tempRealismReturnStep = realismReturnStep;
+			if (IsInADS(a)) {
+				tempRealismRatio *= realismRatioADSMult;
+				tempRealismYawRatio *= realismRatioADSMult;
+				tempRealismReturnStep *= realismReturnStepADSMult;
+			}
+
+			float tempRealismWeight = realismWeight;
+			realismWeight = max(min(realismWeight - eulerZ * tempRealismRatio * REALISM_RATIO_CONSTANT, 1.f), -1.f);
+			realismWeightNoElastic = max(min(realismWeightNoElastic - eulerZ * tempRealismYawRatio * REALISM_RATIO_CONSTANT, 1.f), -1.f);
+			realismReturnStepWeight = min(realismReturnStepWeight + deltaTime / REALISM_RETURNWEIGHT_TIME, 1.f);
+
+			realismRotZ = easeInOutCubic(abs(realismWeight), 0.f, 1.f, 1.f) * Sign(realismWeight) * realismRotLimit + realismDefaultRot;
+			realismRotX = easeInOutQuad(abs(realismWeightNoElastic)) * Sign(realismWeightNoElastic) * realismYawRotLimit;
+
+			if (abs(eulerZ) > 0.01f && tempRealismWeight * realismWeight > 0) {
+				realismReturnStepWeight = REALISM_RETURNWEIGHT_START;
+				if (abs(realismWeight) >= abs(realismWeightSpring)) {
+					realismWeightSpring = realismWeight * realismElasticity;
+				}
+			}
+
+			float realismStep = tempRealismReturnStep * realismReturnStepWeight * min(timeMult, 2.f);
+			if (realismWeightSpring != 0.f) {
+				realismWeight = realismWeight - realismStep * Sign(realismWeightSpring);
+				if (realismWeight * realismWeightSpring < 0) {
+					realismWeight = max(min(realismWeight, abs(realismWeightSpring)), -abs(realismWeightSpring));
+				}
+			} else {
+				if (abs(realismWeight) >= realismStep) {
+					realismWeight -= realismStep * Sign(realismWeight);
+				} else {
+					realismWeight = 0.f;
+				}
+			}
+			realismWeightNoElastic = realismWeightNoElastic - min(realismStep, abs(realismWeightNoElastic)) * Sign(realismWeightNoElastic);
+
+			if ((realismWeight * realismWeightSpring < 0 && abs(realismWeight) >= abs(realismWeightSpring))) {
+				realismReturnStepWeight = 0.f;
+				realismWeightSpring *= -realismElasticity;
+			}
+
+			//_MESSAGE("realismWeight %f realismWeightSpring %f realismRotX %f realismRotZ %f", realismWeight, realismWeightSpring, realismRotX, realismRotZ);
+
+		} else {
+			realismWeight = 0.f;
+			realismRotZ = 0.f;
+		}
+
+#pragma endregion
+
+		if ((IsInADS(a) && rotDisableInADS)) {
 			rotX = 0;
 			rotY = 0;
 			targetRotZ = 0;
 			targetRotX = 0;
+		} else if (inPipboyMenu || a->interactingState != INTERACTING_STATE::kNotInteracting) {
+			rotX = 0;
+			rotY = 0;
+			targetRotZ = 0;
+			targetRotX = 0;
+			realismWeight = 0.f;
+			realismRotZ = 0.f;
 		}
-#pragma endregion
 
 		if (leanADSOnly && !IsInADS(a)) {
 			SetLeanState(0);
@@ -529,12 +726,12 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 
 		if (con) {
 			if (head && pelvis) {
-				float height = max(max(head->world.translate.z, pelvis->world.translate.z) + heightBuffer - a->data.location.z, 10.0f);
+				float height = max(max(head->world.translate.z, pelvis->world.translate.z) + heightBuffer - a->data.location.z, minHeight);
 				//_MESSAGE("Current height %f", height);
 				if (bbx) {
 					float optimalHeight = bbx->extents.z * 2.0f;
 					heightRatio = height / optimalHeight;
-					transDist = isFP ? optimalHeight * sin(leanMax * toRad) : bbx->extents.z * sin(leanMax3rd * toRad);
+					transDist = bbx->extents.z * sin(leanMax3rd * toRad);
 					transDist *= pcScale;
 					transX = isFP ? transDist * leanWeight * heightRatio : transDist * leanWeight;
 					hknpDynamicCompoundShape* colShape = (hknpDynamicCompoundShape*)con->shapes[1]._ptr;
@@ -646,13 +843,20 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 			if (isFP) {
 				NiNode* cameraInserted1st = (NiNode*)node->GetObjectByName("CameraInserted1st");
 				NiNode* camera = (NiNode*)node->GetObjectByName("Camera");
+				NiPoint3 targetCamPos = NiPoint3();
 				if (camera && cameraInserted1st) {
+					NiPoint3 camLocal = camera->local.translate;
+					NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
+					targetCamPos = NiPoint3(camLocal.x, camLocal.y, camLocal.z / 2.f) + Transpose(rot) * NiPoint3(0, 0, camLocal.z / 2.f);
 					if (!leanR6Style) {
-						NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
-						cameraInserted1st->local.translate = colTransX;
+						cameraInserted1st->local.translate = targetCamPos - Transpose(rot) * camLocal + colTransX;
 						cameraInserted1st->local.rotate = rot;
+						if (realism) {
+							rot = rot * GetRotationMatrix33(realismRotZ * toRad, 0, 0) * GetRotationMatrix33(0, 0, -realismRotX * toRad);
+							cameraInserted1st->local.translate = targetCamPos - Transpose(rot) * camLocal + colTransX;
+							cameraInserted1st->local.rotate = rot;
+						}
 					} else {
-						NiMatrix3 rot = GetRotationMatrix33(-rotZ * toRad, 0, 0);
 						NiPoint3 zoomData = NiPoint3();
 						if (p->currentProcess && p->currentProcess->middleHigh) {
 							p->currentProcess->middleHigh->equippedItemsLock.lock();
@@ -666,8 +870,13 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 							p->currentProcess->middleHigh->equippedItemsLock.unlock();
 						}
 						NiPoint3 camPos = camera->local.translate + zoomData;
-						cameraInserted1st->local.translate = rot * camPos - camPos + colTransX;
+						cameraInserted1st->local.translate = targetCamPos - camLocal + colTransX;
 						cameraInserted1st->local.rotate.MakeIdentity();
+						if (realism) {
+							rot = GetRotationMatrix33(realismRotZ * toRad, 0, 0) * GetRotationMatrix33(0, 0, -realismRotX * toRad);
+							cameraInserted1st->local.translate = targetCamPos - Transpose(rot) * camLocal + colTransX;
+							cameraInserted1st->local.rotate = rot;
+						}
 					}
 				}
 
@@ -680,9 +889,8 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 				NiNode* comInserted1st = (NiNode*)node->GetObjectByName("COMInserted1st");
 				if (comInserted1st) {
 					NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
+					comInserted1st->local.translate = targetCamPos - Transpose(rot) * camera->local.translate + colTransX;
 					comInserted1st->local.rotate = rot;
-					comInserted1st->local.translate = colTransX;
-					//_MESSAGE("comInserted");
 				}
 			}
 		}
@@ -690,35 +898,89 @@ bool HookedUpdate(bhkWorld* world, uint32_t destroy)
 		SetLeanState(0);
 	}
 	lastRun = curTime;
-	typedef bool (*FnUpdate)(bhkWorld*, uint32_t);
-	FnUpdate fn = (FnUpdate)bhkWorldUpdateOrig;
-	if (fn)
-		return (*fn)(world, destroy);
-	return false;
-}
-
-void HookedActorUpdate(F4::ProcessLists* list, float deltaTime, bool instant)
-{
-	float curTime = *F4::ptr_engineTime;
-	if (curTime - lastSkeletonUpdate > 1.f) {
-		PreparePlayerSkeleton(p->Get3D());
-		lastSkeletonUpdate = curTime;
-	}
-	NiAVObject* node = p->Get3D();
-	if (node && node != lastRoot) {
-		bbx = (BSBound*)p->Get3D(false)->GetExtraData("BBX");
-		lastRoot = node->IsNode();
-		PreparePlayerSkeleton();
-	}
-
-	typedef void (*FnUpdate)(F4::ProcessLists*, float, bool);
-	FnUpdate fn = (FnUpdate)RunActorUpdatesOrig;
-	if (fn)
-		(*fn)(list, deltaTime, instant);
 }
 
 class InputEventReceiverOverride : public BSInputEventReceiver
 {
+protected:
+	enum
+	{
+		// first 256 for keyboard, then 8 mouse buttons, then mouse wheel up, wheel down, then 16 gamepad buttons
+		kMacro_KeyboardOffset = 0,  // not actually used, just for self-documentation
+		kMacro_NumKeyboardKeys = 256,
+
+		kMacro_MouseButtonOffset = kMacro_NumKeyboardKeys,  // 256
+		kMacro_NumMouseButtons = 8,
+
+		kMacro_MouseWheelOffset = kMacro_MouseButtonOffset + kMacro_NumMouseButtons,  // 264
+		kMacro_MouseWheelDirections = 2,
+
+		kMacro_GamepadOffset = kMacro_MouseWheelOffset + kMacro_MouseWheelDirections,  // 266
+		kMacro_NumGamepadButtons = 16,
+
+		kMaxMacros = kMacro_GamepadOffset + kMacro_NumGamepadButtons  // 282
+	};
+
+	enum
+	{
+		kGamepadButtonOffset_DPAD_UP = kMacro_GamepadOffset,  // 266
+		kGamepadButtonOffset_DPAD_DOWN,
+		kGamepadButtonOffset_DPAD_LEFT,
+		kGamepadButtonOffset_DPAD_RIGHT,
+		kGamepadButtonOffset_START,
+		kGamepadButtonOffset_BACK,
+		kGamepadButtonOffset_LEFT_THUMB,
+		kGamepadButtonOffset_RIGHT_THUMB,
+		kGamepadButtonOffset_LEFT_SHOULDER,
+		kGamepadButtonOffset_RIGHT_SHOULDER,
+		kGamepadButtonOffset_A,
+		kGamepadButtonOffset_B,
+		kGamepadButtonOffset_X,
+		kGamepadButtonOffset_Y,
+		kGamepadButtonOffset_LT,
+		kGamepadButtonOffset_RT  // 281
+	};
+
+	uint32_t GamepadMaskToKeycode(uint32_t keyMask)
+	{
+		switch (keyMask) {
+		case XINPUT_GAMEPAD_DPAD_UP:
+			return kGamepadButtonOffset_DPAD_UP;
+		case XINPUT_GAMEPAD_DPAD_DOWN:
+			return kGamepadButtonOffset_DPAD_DOWN;
+		case XINPUT_GAMEPAD_DPAD_LEFT:
+			return kGamepadButtonOffset_DPAD_LEFT;
+		case XINPUT_GAMEPAD_DPAD_RIGHT:
+			return kGamepadButtonOffset_DPAD_RIGHT;
+		case XINPUT_GAMEPAD_START:
+			return kGamepadButtonOffset_START;
+		case XINPUT_GAMEPAD_BACK:
+			return kGamepadButtonOffset_BACK;
+		case XINPUT_GAMEPAD_LEFT_THUMB:
+			return kGamepadButtonOffset_LEFT_THUMB;
+		case XINPUT_GAMEPAD_RIGHT_THUMB:
+			return kGamepadButtonOffset_RIGHT_THUMB;
+		case XINPUT_GAMEPAD_LEFT_SHOULDER:
+			return kGamepadButtonOffset_LEFT_SHOULDER;
+		case XINPUT_GAMEPAD_RIGHT_SHOULDER:
+			return kGamepadButtonOffset_RIGHT_SHOULDER;
+		case XINPUT_GAMEPAD_A:
+			return kGamepadButtonOffset_A;
+		case XINPUT_GAMEPAD_B:
+			return kGamepadButtonOffset_B;
+		case XINPUT_GAMEPAD_X:
+			return kGamepadButtonOffset_X;
+		case XINPUT_GAMEPAD_Y:
+			return kGamepadButtonOffset_Y;
+		case 0x9:
+			return kGamepadButtonOffset_LT;
+		case 0xA:
+			return kGamepadButtonOffset_RT;
+		default:
+			return kMaxMacros;  // Invalid
+		}
+	}
+
 public:
 	typedef void (InputEventReceiverOverride::*FnPerformInputProcessing)(InputEvent* a_queueHead);
 
@@ -726,7 +988,9 @@ public:
 	{
 		uint32_t id = evn->idCode;
 		if (evn->device == INPUT_DEVICE::kMouse)
-			id += 256;
+			id += kMacro_MouseButtonOffset;
+		else if (evn->device == INPUT_DEVICE::kGamepad)
+			id = GamepadMaskToKeycode(id);
 
 		if (buttonDevMode) {
 			_MESSAGE("Button event fired id %d held %f", id, evn->heldDownSecs);
@@ -830,37 +1094,39 @@ class MenuWatcher : public BSTEventSink<MenuOpenCloseEvent>
 {
 	virtual BSEventNotifyControl ProcessEvent(const MenuOpenCloseEvent& evn, BSTEventSource<MenuOpenCloseEvent>* src) override
 	{
-		if (evn.menuName == BSFixedString("LoadingMenu")) {
+		if (evn.menuName == "LoadingMenu") {
 			if (evn.opening) {
 				isLoading = true;
 				leanState = 0;
 			} else {
 				isLoading = false;
 			}
-		} else if (evn.menuName == BSFixedString("WorkshopMenu")) {
+		} else if (evn.menuName == "WorkshopMenu") {
 			if (evn.opening) {
 				inWorkShopMenu = true;
 			} else {
 				inWorkShopMenu = false;
 			}
-		} else if (evn.menuName == BSFixedString("DialogueMenu")) {
+		} else if (evn.menuName == "DialogueMenu") {
 			if (evn.opening) {
 				inDialogueMenu = true;
 			} else {
 				inDialogueMenu = false;
 			}
-		} else if (evn.menuName == BSFixedString("LooksMenu")) {
+		} else if (evn.menuName == "LooksMenu") {
 			if (evn.opening) {
 				inLooksMenu = true;
 			} else {
 				inLooksMenu = false;
 			}
-		} else if (evn.menuName == BSFixedString("PipboyMenu")) {
+		} else if (evn.menuName == "PipboyMenu") {
 			if (evn.opening) {
 				inPipboyMenu = true;
 			} else {
 				inPipboyMenu = false;
 			}
+		} else if (!evn.opening && evn.menuName == "PauseMenu") {
+			LoadConfigs();
 		}
 		return BSEventNotifyControl::kContinue;
 	}
@@ -888,17 +1154,6 @@ void InitializePlugin()
 	MenuWatcher* mw = new MenuWatcher();
 	UI::GetSingleton()->GetEventSource<MenuOpenCloseEvent>()->RegisterSink(mw);
 	pick = new bhkPickData();
-
-	/*bool succ = PCUpdatePickRefHook.Create((LPVOID)(ptr_PCUpdatePickRef.address()), HookedUpdate);
-	if (succ) {
-		PCUpdatePickRefOrig = (uintptr_t)PCUpdatePickRefHook.GetTrampoline();
-		_MESSAGE("Detour success. Addr %llx Orig %llx", ptr_PCUpdatePickRef.address(), PCUpdatePickRefOrig);
-	}*/
-	bool succ = bhkWorldUpdateHook.Create((LPVOID)(ptr_bhkWorldUpdate.address()), HookedUpdate);
-	if (succ) {
-		bhkWorldUpdateOrig = (uintptr_t)bhkWorldUpdateHook.GetTrampoline();
-		_MESSAGE("Detour success. Addr %llx Orig %llx", ptr_bhkWorldUpdate.address(), bhkWorldUpdateOrig);
-	}
 }
 
 #pragma endregion
@@ -936,7 +1191,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 	a_info->version = Version::MAJOR;
 
 	if (a_f4se->IsEditor()) {
-		logger::critical("loaded in editor"sv);
+		logger::critical(FMT_STRING("loaded in editor"));
 		return false;
 	}
 
@@ -967,6 +1222,12 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 		if (msg->type == F4SE::MessagingInterface::kGameDataReady) {
 			InitializePlugin();
 			LoadConfigs();
+		} else if (msg->type == F4SE::MessagingInterface::kGameLoaded) {
+			BSScaleformTranslator* translator = (BSScaleformTranslator*)BSScaleformManager::GetSingleton()->loader->GetStateAddRef(Scaleform::GFx::State::StateType::kTranslator);
+			if (translator) {
+				Translation::ParseTranslation(translator, "UneducatedShooter");
+				_MESSAGE("Translation injected");
+			}
 		} else if (msg->type == F4SE::MessagingInterface::kPostLoadGame) {
 			LoadConfigs();
 		} else if (msg->type == F4SE::MessagingInterface::kNewGame) {
