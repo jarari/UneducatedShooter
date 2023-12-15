@@ -725,6 +725,7 @@ void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 		float transZByTwo = transZ / 2.0f;
 		float transX = 0.f;
 
+		NiNode* camera = (NiNode*)node->GetObjectByName("Camera");
 		if (con) {
 			if (head && pelvis) {
 				float height = max(max(head->world.translate.z, pelvis->world.translate.z) + heightBuffer - a->data.location.z, minHeight);
@@ -732,7 +733,10 @@ void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 				if (bbx) {
 					float optimalHeight = bbx->extents.z * 2.0f;
 					heightRatio = height / optimalHeight;
-					transDist = isFP ? bbx->extents.z * sin(leanMax * toRad) : bbx->extents.z * sin(leanMax3rd * toRad);
+					float camZ = 60.f;
+					if (camera)
+						camZ = camera->local.translate.z;
+					transDist = isFP ? camZ / 2.f * sin(leanMax * toRad) : camZ / 2.f * sin(leanMax3rd * toRad);
 					transDist *= pcScale;
 					transX = transDist * leanWeight;
 					hknpDynamicCompoundShape* colShape = (hknpDynamicCompoundShape*)con->shapes[1]._ptr;
@@ -843,7 +847,6 @@ void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 
 			if (isFP) {
 				NiNode* cameraInserted1st = (NiNode*)node->GetObjectByName("CameraInserted1st");
-				NiNode* camera = (NiNode*)node->GetObjectByName("Camera");
 				NiPoint3 targetCamPos = NiPoint3();
 				if (camera && cameraInserted1st) {
 					NiPoint3 camLocal = camera->local.translate;
