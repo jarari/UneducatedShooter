@@ -100,6 +100,7 @@ bool inWorkShopMenu = false;
 bool inLooksMenu = false;
 bool inDialogueMenu = false;
 bool inPipboyMenu = false;
+bool inVATSMenu = false;
 
 #define REALISM_RATIO_CONSTANT 0.45f
 #define REALISM_RETURNWEIGHT_START 0.75f
@@ -567,8 +568,8 @@ void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 		float step = rotReturnStep * conditionalMultiplier * timeMult;
 		float retDiv = pow(pow(max(rotReturnDiv * conditionalMultiplier, rotReturnDivMin), 30.f), deltaTime);
 		float followDiv = pow(pow(3.0f, 30.f), deltaTime);
-		targetRotZ -= eulerZ / toRad / tempRotDivY * 5.f;
-		targetRotX -= eulerX / toRad / tempRotDivX * 5.f;
+		targetRotZ += eulerZ / toRad / tempRotDivY * 5.f;
+		targetRotX += eulerX / toRad / tempRotDivX * 5.f;
 		rotX += (targetRotX - rotX) / followDiv;
 		rotX = max(min(rotX, rotLimitX), -rotLimitX);
 		rotY += (targetRotZ - rotY) / followDiv;
@@ -731,9 +732,9 @@ void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 				if (bbx) {
 					float optimalHeight = bbx->extents.z * 2.0f;
 					heightRatio = height / optimalHeight;
-					transDist = bbx->extents.z * sin(leanMax3rd * toRad);
+					transDist = isFP ? bbx->extents.z * sin(leanMax * toRad) : bbx->extents.z * sin(leanMax3rd * toRad);
 					transDist *= pcScale;
-					transX = isFP ? transDist * leanWeight * heightRatio : transDist * leanWeight;
+					transX = transDist * leanWeight;
 					hknpDynamicCompoundShape* colShape = (hknpDynamicCompoundShape*)con->shapes[1]._ptr;
 					//_MESSAGE("Optimal height %f", optimalHeight);
 					if (deltaLeanWeight != 0) {
@@ -753,7 +754,7 @@ void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 						con->GetTransformImpl(charProxyTransform);
 						float deltaDist = transDist * deltaLeanWeight / HAVOKTOFO4;
 						pick->Reset();
-						GetPickDataCELL(a->data.location + NiPoint3(0, 0, 25.f), a->data.location + NiPoint3(0, 0, 25.f) - right * transDist * Sign(deltaLeanWeight), a, *pick);
+						GetPickDataCELL(a->data.location + NiPoint3(0, 0, height / 2.f), a->data.location + NiPoint3(0, 0, height / 2.f) - right * transDist * Sign(deltaLeanWeight), a, *pick);
 						hkVector4f displacement = right * -deltaDist;
 						if (!pick->HasHit()) {
 							charProxyTransform.m_translation.v.x += displacement.x;
@@ -847,9 +848,10 @@ void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 				if (camera && cameraInserted1st) {
 					NiPoint3 camLocal = camera->local.translate;
 					NiMatrix3 rot = GetRotationMatrix33(rotZ * toRad, 0, 0);
-					targetCamPos = NiPoint3(camLocal.x, camLocal.y, camLocal.z / 2.f) + Transpose(rot) * NiPoint3(0, 0, camLocal.z / 2.f);
+					NiMatrix3 baseRotTranspose = Transpose(rot);
+					targetCamPos = NiPoint3(camLocal.x, camLocal.y, camLocal.z / 2.f) + baseRotTranspose * NiPoint3(0, 0, camLocal.z / 2.f);
 					if (!leanR6Style) {
-						cameraInserted1st->local.translate = targetCamPos - Transpose(rot) * camLocal + colTransX;
+						cameraInserted1st->local.translate = targetCamPos - baseRotTranspose * camLocal + colTransX;
 						cameraInserted1st->local.rotate = rot;
 						if (realism) {
 							rot = rot * GetRotationMatrix33(realismRotZ * toRad, 0, 0) * GetRotationMatrix33(0, 0, -realismRotX * toRad);
@@ -869,13 +871,14 @@ void HookedActorUpdate(F4::ProcessLists* list, float dt, bool instant)
 							}
 							p->currentProcess->middleHigh->equippedItemsLock.unlock();
 						}
-						NiPoint3 camPos = camera->local.translate + zoomData;
-						cameraInserted1st->local.translate = targetCamPos - camLocal + colTransX;
-						cameraInserted1st->local.rotate.MakeIdentity();
+						NiPoint3 r6sDiff = baseRotTranspose * zoomData - zoomData;
 						if (realism) {
 							rot = GetRotationMatrix33(realismRotZ * toRad, 0, 0) * GetRotationMatrix33(0, 0, -realismRotX * toRad);
-							cameraInserted1st->local.translate = targetCamPos - Transpose(rot) * camLocal + colTransX;
+							cameraInserted1st->local.translate = targetCamPos - Transpose(rot) * camLocal + r6sDiff + colTransX;
 							cameraInserted1st->local.rotate = rot;
+						} else {
+							cameraInserted1st->local.translate = targetCamPos - camLocal + r6sDiff + colTransX;
+							cameraInserted1st->local.rotate.MakeIdentity();
 						}
 					}
 				}
@@ -1027,7 +1030,7 @@ public:
 
 	void HookedPerformInputProcessing(InputEvent* a_queueHead)
 	{
-		if (!UI::GetSingleton()->menuMode && !disableLean) {
+		if (!UI::GetSingleton()->menuMode && !disableLean && !inVATSMenu) {
 			InputEvent* evn = a_queueHead;
 			while (evn) {
 				if (evn->eventType == INPUT_EVENT_TYPE::kButton) {
@@ -1124,6 +1127,12 @@ class MenuWatcher : public BSTEventSink<MenuOpenCloseEvent>
 				inPipboyMenu = true;
 			} else {
 				inPipboyMenu = false;
+			}
+		} else if (evn.menuName == "VATSMenu") {
+			if (evn.opening) {
+				inVATSMenu = true;
+			} else {
+				inVATSMenu = false;
 			}
 		} else if (!evn.opening && evn.menuName == "PauseMenu") {
 			LoadConfigs();
