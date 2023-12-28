@@ -319,23 +319,30 @@ void LoadConfigs()
 	std::string hotkeyPath = "Data\\MCM\\Settings\\Keybinds.json";
 	if (std::filesystem::exists(hotkeyPath)) {
 		std::ifstream reader;
-		reader.open(hotkeyPath);
-		nlohmann::json keyBinds;
-		reader >> keyBinds;
-		reader.close();
-		if (keyBinds.contains("keybinds")) {
-			for (auto& key : keyBinds["keybinds"]) {
-				try {
-					if (key["modName"].get<std::string>() == "UneducatedShooter") {
-						if (key["id"].get<std::string>() == "keyLeanLeft") {
-							leanLeft = key["keycode"].get<int>();
-						} else if (key["id"].get<std::string>() == "keyLeanRight") {
-							leanRight = key["keycode"].get<int>();
+		try {
+			reader.open(hotkeyPath);
+			nlohmann::json keyBinds;
+			reader >> keyBinds;
+			reader.close();
+			if (keyBinds.contains("keybinds")) {
+				for (auto& key : keyBinds["keybinds"]) {
+						if (key["modName"].get<std::string>() == "UneducatedShooter") {
+							if (key["id"].get<std::string>() == "keyLeanLeft") {
+								leanLeft = key["keycode"].get<int>();
+							} else if (key["id"].get<std::string>() == "keyLeanRight") {
+								leanRight = key["keycode"].get<int>();
+							}
 						}
-					}
-				} catch (...) {
-					continue;
 				}
+			}
+		} catch (...) {
+			if (reader.is_open()) {
+				std::stringstream buffer;
+				buffer << reader.rdbuf();
+				_MESSAGE("Error: Keybinds.json parsing error.\nContent: %s", buffer.str().c_str());
+				reader.close();
+			} else {
+				_MESSAGE("Error: Could not open Keybinds.json");
 			}
 		}
 	}
